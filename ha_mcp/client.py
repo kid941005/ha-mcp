@@ -17,17 +17,12 @@ from typing import Any
 
 import httpx
 
+from .config import env_bool, env_float
+
 try:  # 设备/实体注册表需通过 HA WebSocket API 读取；缺失时降级为按实体展示
     import websockets
 except Exception:  # noqa: BLE001
     websockets = None
-
-
-def env_bool(name: str, default: bool) -> bool:
-    v = os.environ.get(name)
-    if v is None or v == "":
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 class HAError(Exception):
@@ -51,16 +46,18 @@ class HAClient:
                  timeout: float | None = None, verify_ssl: bool | None = None):
         self.base_url = (url if url is not None else os.environ.get("HA_URL") or "").rstrip("/")
         self.token = (token if token is not None else os.environ.get("HA_TOKEN") or "").strip()
-        self.timeout = float(timeout if timeout is not None else os.environ.get("HA_TIMEOUT", "10"))
+        self.timeout = float(timeout) if timeout is not None else env_float("HA_TIMEOUT", 10.0, 0.1, 300.0)
         self.verify_ssl = env_bool("HA_VERIFY_SSL", True) if verify_ssl is None else verify_ssl
         # 默认不读取宿主的 HTTP_PROXY/NO_PROXY 等环境变量，避免代理干扰容器内直连 HA。
         self.trust_env = env_bool("HA_TRUST_ENV", False)
         # 设备/实体注册表：HA 只在 WebSocket API 暴露（REST 无此端点），用于“按设备聚合”。
         self.ws_url = (os.environ.get("HA_WS_URL") or "").strip() or self._derive_ws_url()
         self.ws_enabled = env_bool("HA_WS_ENABLED", True)
-        self.registry_ttl = float(os.environ.get("HA_REGISTRY_TTL", "60"))
+        self.registry_ttl = env_float("HA_REGISTRY_TTL", 60.0, 0.0, 3600.0)
+        self.registry_error_ttl = env_float("HA_REGISTRY_ERROR_TTL", 10.0, 0.0, 3600.0)
         self._registry_cache: dict | None = None
         self._registry_ts: float = 0.0
+        self._http: httpx.AsyncClient | None = None
         self._validate_config()
 
     def _validate_config(self) -> None:
@@ -77,22 +74,31 @@ class HAClient:
 
     # ---------------- 底层 HTTP ----------------
     def _client(self) -> httpx.AsyncClient:
-        headers = {
-            "Authorization": "Bearer " + self.token,
-            "Content-Type": "application/json",
-        }
-        return httpx.AsyncClient(
-            base_url=self.base_url,
-            headers=headers,
-            timeout=self.timeout,
-            verify=self.verify_ssl,
-            trust_env=self.trust_env,
-        )
+        """懒创建并复用 HTTP 连接池，避免每次调用都新建 TLS 连接。"""
+        if self._http is None:
+            headers = {
+                "Authorization": "Bearer " + self.token,
+                "Content-Type": "application/json",
+            }
+            self._http = httpx.AsyncClient(
+                base_url=self.base_url,
+                headers=headers,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+                trust_env=self.trust_env,
+            )
+        return self._http
+
+    async def aclose(self) -> None:
+        """释放连接池（进程退出或测试收尾时调用）。"""
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     async def _request(self, method: str, path: str, json: Any = None) -> Any:
         try:
-            async with self._client() as client:
-                resp = await client.request(method, path, json=json)
+            client = self._client()
+            resp = await client.request(method, path, json=json)
         except httpx.ConnectError as e:
             raise HAError(
                 "unreachable",
@@ -177,8 +183,13 @@ class HAClient:
         if not self.ws_enabled or websockets is None:
             return None
         now = time.time()
-        if not force and self._registry_cache is not None and (now - self._registry_ts) < self.registry_ttl:
+        age = now - self._registry_ts
+        if not force and self._registry_cache is not None and age < self.registry_ttl:
             return self._registry_cache
+        # 失败结果只短缓存，避免 WS 瞬时故障后 60 秒内都不再重试
+        if (not force and self._registry_cache is None and self._registry_ts
+                and age < self.registry_error_ttl):
+            return None
         try:
             data = await self._ws_registries()
         except HAError:

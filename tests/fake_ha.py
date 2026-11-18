@@ -48,7 +48,8 @@ STATES = {
     },
     "media_player.tv": {
         "entity_id": "media_player.tv", "state": "idle",
-        "attributes": {"friendly_name": "电视", "volume_level": 0.3, "is_volume_muted": False},
+        "attributes": {"friendly_name": "电视", "volume_level": 0.3, "is_volume_muted": False,
+                       "source_list": ["HDMI1", "HDMI2"], "extra_debug": {"a": 1}},
         "last_changed": "2026-01-01T00:00:00+00:00", "last_updated": "2026-01-01T00:00:00+00:00",
     },
     "cover.curtain": {

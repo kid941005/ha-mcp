@@ -25,7 +25,7 @@
 
 - 小智后端启动时对本服务做 `list_tools`，把工具定义并入 LLM 的 function 列表；
 - 用户自然语言 → LLM 选择工具与参数 → 小智后端 `call_tool` → 本服务翻译为 HA REST 调用 → 返回给 LLM 生成回复；
-- 本服务**无状态**，水平扩展即可；只从环境变量读取 `HA_URL` / `HA_TOKEN`。
+- 本服务不持久化业务数据；设备注册表采用进程内 TTL 缓存，危险确认令牌也保存在单进程内存，因此**当前按单实例部署**（多副本需共享令牌或改用签名令牌方案）；只从环境变量读取 `HA_URL` / `HA_TOKEN`。
 
 ---
 
@@ -33,8 +33,16 @@
 
 ```
 ha-mcp/
-├── server.py                              # MCP 服务 + 6 个工具
-├── ha_client.py                           # HA REST 客户端 / 错误处理 / 实体解析
+├── ha_mcp/                                # Python 包（应用代码）
+│   ├── __init__.py
+│   ├── __main__.py                        # python -m ha_mcp 入口
+│   ├── config.py                          # 环境变量解析与运行常量（非法值回退）
+│   ├── client.py                          # HA REST/WS 客户端 / 错误处理 / 实体解析
+│   ├── service.py                         # 动作映射 / 状态与属性预期 / 回读校验
+│   ├── danger.py                          # 危险设备判定 / 一次性确认令牌
+│   ├── views.py                           # 实体摘要 / 可控标记 / 按设备聚合
+│   └── server.py                          # MCP 工具定义 + 健康检查 + 入口
+├── server.py                              # 兼容入口（等价于 python -m ha_mcp）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml                     # 独立构建运行
@@ -55,19 +63,21 @@ ha-mcp/
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `HA_URL` | ✅ | — | Home Assistant 地址，如 `https://ha.hqgg.top:59826`（结尾不要带 `/`） |
+| `HA_URL` | ✅ | — | Home Assistant 地址，如 `https://your-ha.example:8123`（结尾不要带 `/`） |
 | `HA_TOKEN` | ✅ | — | HA 长期访问令牌（个人资料 → 安全 → 长期访问令牌） |
 | `MCP_TRANSPORT` | | `streamable-http` | `streamable-http` / `sse` / `stdio` |
 | `MCP_HOST` | | `0.0.0.0` | 监听地址 |
 | `MCP_PORT` | | `8090` | 监听端口 |
 | `MCP_PATH` | | `/mcp` | streamable-http 路径 |
 | `MCP_SSE_PATH` | | `/sse` | sse 路径（仅 sse 传输时用） |
+| `MCP_STATELESS` | | `false` | 是否使用无状态 HTTP 传输（仅传输层；多副本仍需共享危险确认令牌/注册表缓存） |
 | `HA_TIMEOUT` | | `10` | 访问 HA 的超时秒数 |
 | `HA_VERIFY_SSL` | | `true` | 是否校验 HA 的 TLS 证书（自签名证书设 `false`） |
 | `HA_TRUST_ENV` | | `false` | 是否读取宿主 HTTP(S)_PROXY/NO_PROXY（默认关闭，避免代理干扰直连 HA） |
 | `HA_WS_ENABLED` | | `true` | 是否用 WebSocket 读取设备/实体注册表以支持「按设备聚合」 |
 | `HA_WS_URL` | | 由 `HA_URL` 推导 | HA WebSocket 地址，如 `ws://homeassistant:8123/api/websocket` |
-| `HA_REGISTRY_TTL` | | `60` | 设备/实体注册表缓存秒数 |
+| `HA_REGISTRY_TTL` | | `60` | 设备/实体注册表成功缓存秒数 |
+| `HA_REGISTRY_ERROR_TTL` | | `10` | 注册表读取失败后的重试间隔（秒），避免瞬时 WS 故障后长时间不重试 |
 | `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `DEFAULT_LIST_LIMIT` | | `50` | `list_devices` 默认每页条数 |
 | `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数（防止一次返回过多） |
@@ -94,7 +104,7 @@ cp .env.example .env
 # 编辑 .env，填入 HA_URL 与 HA_TOKEN
 docker compose up -d --build
 docker compose logs -f          # 观察启动日志
-curl -s http://127.0.0.1:8090/health   # 应返回 {"status":"ok",...,"ha":"reachable"}
+curl -s http://127.0.0.1:8090/ready    # 应返回 {"status":"ok",...,"ha":"reachable"}
 ```
 
 ### 4.2 docker build / run
@@ -104,7 +114,7 @@ docker build -t ha-mcp:latest .
 
 docker run -d --name ha-mcp \
   -p 8090:8090 \
-  -e HA_URL=https://ha.hqgg.top:59826 \
+  -e HA_URL=https://your-ha.example:8123 \
   -e HA_TOKEN=你的HA长期访问令牌 \
   --restart unless-stopped \
   ha-mcp:latest
@@ -118,14 +128,14 @@ docker run -d --name ha-mcp \
 python -m venv .venv
 . .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-export HA_URL=https://ha.hqgg.top:59826
+export HA_URL=https://your-ha.example:8123
 export HA_TOKEN=你的HA长期访问令牌
-python server.py
+python -m ha_mcp
 ```
 
 服务启动后：
 - MCP 端点：`http://<host>:8090/mcp`（streamable-http）
-- 健康检查：`http://<host>:8090/health`
+- 健康检查：`http://<host>:8090/health`（liveness）/ `http://<host>:8090/ready`（readiness）
 
 ---
 
@@ -154,8 +164,10 @@ python server.py
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `entity` | string | 是 | entity_id（如 `light.living_room`）或友好名称（如「客厅灯」）；服务端自动解析，多义时返回候选 |
+| `include_all_attributes` | bool | 否 | 默认 `false` 只返回关键属性；需要完整 `attributes` 时传 `true` |
 
-返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,last_changed,last_updated},message}`
+返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,attributes_truncated,attribute_count,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,last_changed,last_updated},message}`
+默认只返回亮度/色温/音量/温度/位置/电池等关键属性，避免媒体、摄像头等实体的巨大 attributes 占用上下文；`attributes_truncated=true` 表示还有更多属性。
 
 ### 5.3 `control_device` — 控制设备
 
@@ -163,7 +175,7 @@ python server.py
 |---|---|---|---|
 | `entity` | string | 是 | 目标设备：entity_id 或友好名称 |
 | `action` | string | 是 | 见下表 |
-| `value` | number | 视动作 | 亮度/音量百分比(1-100)、温度(℃)、色温(K) |
+| `value` | number / string / array | 视动作 | 亮度/音量百分比(1-100)、温度(℃)、色温(K)；颜色支持 `#RRGGBB`、`"r,g,b"` 或 `[r,g,b]` |
 | `confirm_token` | string | 危险设备时 | 危险设备二次确认令牌（首次调用返回，用户确认后再带此参数重试） |
 
 `action` 取值（服务端按设备 domain 自动映射到 HA 服务）：
@@ -179,7 +191,7 @@ python server.py
 | `volume_mute` / `volume_unmute` | 静音 / 取消静音 | — |
 | `set_temperature` | 设置温度（climate） | 摄氏度 |
 | `set_color_temp` | 设置色温（light） | 开尔文 |
-| `set_color` | 设置颜色（light） | `#RRGGBB` 或 `"r,g,b"` |
+| `set_color` | 设置颜色（light） | `#RRGGBB`、`"r,g,b"` 或 `[r,g,b]` |
 
 返回：`{ok,entity_id,name,action,service,response_kind,status,expected_state,before,after,changed,verified,verification,message}`
 **控制后状态+属性回读校验**：服务调用后会在 `SERVICE_CONFIRM_TIMEOUT` 秒内轮询回读，既核对状态（如 turn_on→on），也核对属性（亮度、温度、音量、色温、颜色等），`status` 为：
@@ -203,7 +215,8 @@ python server.py
 | `keyword` | string | 否 | 按服务名或描述关键字过滤（如 `temperature`） |
 | `detailed` | bool | 否 | 是否返回字段参数明细（指定 entity/domain 时默认 true，否则仅名称） |
 
-返回：`{ok,domain,domain_count,service_count,domains:[{domain,service_count,services:[{service,name?,description?,fields?:[{name,required,selector?,example?}]}]}],message}`
+返回：`{ok,domain,domain_count,service_count,domains:[{domain,service_count,services:[...]}],message}`。
+`detailed=true` 时 `services` 为对象列表（`service/name?/description?/fields?`），否则为服务名字符串列表。
 数据源为 HA `GET /api/services`。
 
 ### 5.5 `call_service` — 通用服务调用
@@ -224,7 +237,8 @@ python server.py
 
 ### 5.6 `list_domains` — 获取设备类型
 
-无参数。返回 `{ok,domains:{light:3,switch:2,...},controllable_domains:["light","switch",...],dangerous_domains:["lock",...],message}`，便于了解家庭设备类别、哪些类型可控制、哪些类型需二次确认，或选择 `domain` 过滤。
+无参数。返回 `{ok,domains:{light:3,switch:2,...},controllable_domains:["light","switch",...],dangerous_domains:["lock",...],dangerous_entities:[{entity_id,name,domain,state,reason}],dangerous_entity_count,message}`。
+`dangerous_entities` 会识别 `lock`/`alarm_control_panel` 以及 `device_class=garage/door/gate/window` 的 cover，便于了解哪些具体实体操作需要二次确认。
 
 ---
 
@@ -303,6 +317,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | 空调能做什么操作？ | `list_services` | `{"entity":"空调"}` | `{"ok":true,"domain":"climate","service_count":4,"services":[{"service":"set_temperature","fields":[{"name":"temperature","required":true}]},...]}` |
 | 空调设成制热模式 | `call_service` | `{"entity":"空调","service":"climate.set_hvac_mode","data":{"hvac_mode":"heat"}}` | `{"ok":true,"status":"confirmed","after":{"state":"heat"}}` |
 | 把客厅灯切成暖光 | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"color_temp_kelvin":2700}}` | `{"ok":true,"status":"confirmed","verified":true,"verification":{"attempts":1,...}}` |
+| 把客厅灯调成红色 | `control_device` | `{"entity":"客厅灯","action":"set_color","value":"#ff0000"}` | `{"ok":true,"service":"light.turn_on","changed":true,"after":{"rgb_color":[255,0,0]}}` |
 | 把客厅灯亮度调到 80（设备没调到） | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"brightness_pct":80}}` | `{"ok":true,"status":"mismatch","verified":false,"verification":{"mismatches":[{"field":"brightness","expected":204,"actual":127}]}}` |
 
 失败示例（清晰提示，不崩溃）：
@@ -311,7 +326,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 // 设备不存在
 {"ok": false, "code": "not_found", "message": "未找到设备『不存在设备』，无法控制。可先用 list_devices 查询。"}
 // 动作不支持
-{"ok": false, "code": "unsupported_action", "message": "不支持的控制动作：fly。可用动作：turn_on, turn_off, ..."}
+{"ok": false, "code": "unsupported_action", "message": "『客厅灯』（light）不支持动作：fly。该类型可用动作：turn_on, turn_off, toggle, ..."}
 // 设备不可控制（如传感器）
 {"ok": false, "code": "not_controllable", "message": "『客厅温度』（sensor）不可控制：该类型无内置控制动作..."}
 // 危险设备未二次确认
@@ -331,13 +346,16 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | `unreachable` | 连不上 HA | 检查 `HA_URL`、网络连通、容器能否访问该地址 |
 | `timeout` | 请求 HA 超时 | 增大 `HA_TIMEOUT` 或检查网络/HA 负载 |
 | `upstream_error` | HA 5xx | 查看 HA 自身日志/健康状况 |
+| `http_error` | HA 返回非 2xx（401/403/404/5xx 之外） | 查看 HA 日志与请求参数 |
+| `network_error` | 连接/传输层错误（DNS、TLS、连接被重置等） | 检查网络、代理、TLS 证书与 `HA_URL` |
 | `not_found` | 实体/资源不存在 | 用 `list_devices` 查正确 entity_id |
 | `not_controllable` | 设备类型无内置控制动作（如 sensor） | 只用 `get_device_state` 查询，或 `list_services` 后用 `call_service` |
 | `ambiguous` | 名称匹配到多个设备 | 改用更精确名称或 entity_id |
 | `missing_value` / `invalid_value` | 动作缺参数或取值越界 | 按工具描述传 1-100 等合法值 |
-| `unsupported_action` | 动作不支持 | 使用 `SUPPORTED_ACTIONS` 中的动作 |
+| `unsupported_action` | 动作不支持（含该设备类型不支持） | 使用返回的 `actions` 列表，或 `list_services` 后用 `call_service` |
 | `invalid_service` | `call_service` 的 service 为空/格式错 | 用 `list_services` 查服务名，格式 `service` 或 `domain.service` |
-| `invalid_data` | `data` 不是 JSON 对象 | 传键值对对象，如 `{"temperature":26}` |
+| `invalid_data` | `data` 不是 JSON 对象、包含 `entity_id` 或字段值非法（如 `rgb_color` 分量越界） | 传键值对对象，如 `{"temperature":26}`；目标实体只用 `entity` 参数指定 |
+| `invalid_group_by` | `group_by` 取值不支持 | 使用 `entity`（默认）或 `device` |
 | `no_services` | 指定 domain 无可用服务 | 核对 domain 或用 `list_services` 不带过滤查看 |
 | `confirmation_required` | 危险设备首次调用，未带 `confirm_token`（未执行） | 向用户确认后带返回的 `confirm_token` 重试 |
 | `invalid_confirm_token` | 令牌无效或已使用（一次性） | 重新发起原操作获取新令牌 |
@@ -346,12 +364,13 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 
 ### 8.2 排查步骤
 
-1. **看服务健康**：`curl http://127.0.0.1:8090/health`
-   - `"ha":"reachable"` 正常；`"ha":"error"` 时看 `ha_error` 的具体 code。
+1. **看服务健康**：`curl http://127.0.0.1:8090/health`（liveness，仅表示 MCP 进程在运行）
+   和 `curl http://127.0.0.1:8090/ready`（readiness，HA 可达才 200）。
+   - `/ready` 返回 `"ha":"reachable"` 正常；`"ha":"error"` 时看 `ha_error` 的具体 code。
 2. **看日志**：`docker logs ha-mcp 2>&1 | tail -50`。
 3. **单独验证 HA**（排除本服务问题）：
    ```bash
-   curl -s -H "Authorization: Bearer <你的令牌>" https://ha.hqgg.top:59826/api/states | head -c 300
+   curl -s -H "Authorization: Bearer <你的令牌>" https://your-ha.example:8123/api/states | head -c 300
    ```
    - 401 → 令牌问题；连接被拒 → 地址/网络问题。
 4. **网络**：容器内访问 HA 注意
@@ -394,7 +413,7 @@ python tests/fake_ha.py
 export HA_URL=http://127.0.0.1:8123
 export HA_TOKEN=任意本地测试口令
 export HA_WS_URL=ws://127.0.0.1:8124/api/websocket   # 注册表 WS（fake_ha 默认 8124）
-python server.py
+python -m ha_mcp
 
 # 终端 3：用真实 MCP 客户端跑端到端用例
 python tests/e2e_mcp_client.py

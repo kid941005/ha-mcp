@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 再拷贝源码
-COPY ha_client.py server.py ./
+COPY ha_mcp ./ha_mcp
 
 # 以非 root 用户运行
 RUN useradd -m -u 10001 appuser
@@ -30,6 +30,6 @@ ENV MCP_TRANSPORT=streamable-http \
 EXPOSE 8090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MCP_PORT','8090')+'/health', timeout=3)" || exit 1
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MCP_PORT','8090')+'/ready', timeout=3)" || exit 1
 
-CMD ["python", "server.py"]
+CMD ["python", "-m", "ha_mcp"]
