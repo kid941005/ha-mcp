@@ -5,7 +5,8 @@
 
 > 核心特性：配置只走环境变量（不硬编码）、只读/控制一体化、服务能力自描述（`list_services`）、
 > 通用服务调用（`call_service`，覆盖任意 HA 服务）、控制后状态+属性四态回读校验（confirmed/no_change/mismatch/accepted_pending）、
-> 每个实体带 `controllable` 可控标记与 `actions` 动作清单、`group_by="device"` 按物理设备聚合、
+> 危险设备（门锁/安防面板/车库门/门窗类 cover）二次确认令牌防误操作、
+> 每个实体带 `controllable` 可控标记、`dangerous` 危险标记与 `actions` 动作清单、`group_by="device"` 按物理设备聚合、
 > 错误全部转为中文可读提示且服务不崩溃、设备列表支持过滤与分页。
 
 ---
@@ -74,6 +75,10 @@ ha-mcp/
 | `SERVICE_CONFIRM_RETRIES` | | `1` | 服务调用后回读的额外重试次数 |
 | `SERVICE_CONFIRM_INTERVAL` | | 同 `SERVICE_CONFIRM_DELAY` | 回读轮询间隔秒数 |
 | `SERVICE_CONFIRM_TIMEOUT` | | `4.0` | 回读确认总超时秒数（窗口内持续轮询直到匹配预期） |
+| `DANGER_CONFIRM_ENABLED` | | `true` | 是否对危险设备启用二次确认（设 `false` 可关闭） |
+| `DANGER_CONFIRM_TTL` | | `120` | 危险操作确认令牌有效期（秒），一次性使用 |
+| `DANGEROUS_DOMAINS` | | `lock,alarm_control_panel` | 视为危险设备的 domain（逗号分隔） |
+| `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
 
 > 安全：`HA_TOKEN` 只通过环境变量注入，不写入镜像、不写入代码、不写进 Git。
 
@@ -140,8 +145,8 @@ python server.py
 | `limit` | int | 否 | 每页条数，默认取 `DEFAULT_LIST_LIMIT`，上限 `MAX_LIST_LIMIT` |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
-返回（entity 模式）：`{ok,grouped_by:"entity",registry_available,total,count,offset,limit,has_more,next_offset,devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,device_id,device_name,area_id}],message}`
-返回（device 模式）：`{ok,grouped_by:"device",registry_available,total,count,...,devices:[{device_id,name,manufacturer,model,area_id,controllable,entity_count,entities:[...]}],message}`
+返回（entity 模式）：`{ok,grouped_by:"entity",registry_available,total,count,offset,limit,has_more,next_offset,devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id}],message}`
+返回（device 模式）：`{ok,grouped_by:"device",registry_available,total,count,...,devices:[{device_id,name,manufacturer,model,area_id,controllable,dangerous,entity_count,entities:[...]}],message}`
 > `registry_available:false` 表示 HA WebSocket 注册表不可用（令牌无权限/WS 不通），此时自动降级为按实体展示，不影响状态查询与控制。
 
 ### 5.2 `get_device_state` — 获取设备状态
@@ -150,7 +155,7 @@ python server.py
 |---|---|---|---|
 | `entity` | string | 是 | entity_id（如 `light.living_room`）或友好名称（如「客厅灯」）；服务端自动解析，多义时返回候选 |
 
-返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,controllable,actions,controllable_reason,device_id,device_name,area_id,last_changed,last_updated},message}`
+返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,last_changed,last_updated},message}`
 
 ### 5.3 `control_device` — 控制设备
 
@@ -159,6 +164,7 @@ python server.py
 | `entity` | string | 是 | 目标设备：entity_id 或友好名称 |
 | `action` | string | 是 | 见下表 |
 | `value` | number | 视动作 | 亮度/音量百分比(1-100)、温度(℃)、色温(K) |
+| `confirm_token` | string | 危险设备时 | 危险设备二次确认令牌（首次调用返回，用户确认后再带此参数重试） |
 
 `action` 取值（服务端按设备 domain 自动映射到 HA 服务）：
 
@@ -184,6 +190,8 @@ python server.py
 `verification` 给出 `attempts`（回读次数）、`elapsed_ms`、`expectations`、`checks`、`mismatches`，便于调用方判断是否真正生效，避免 HA「对不存在实体也返回 200」造成的静默假成功。
 > 若设备类型本身不可控制（如 `sensor`），返回 `code:"not_controllable"` 并说明原因，不会误发服务。
 
+> **危险设备二次确认（防误操作）**：`lock`、`alarm_control_panel` 以及 device_class 为 `garage`/`door`/`gate`/`window` 的 `cover` 默认视为危险设备。首次调用会返回 `code:"confirmation_required"`、`dangerous:true`、`requires_confirmation:true`、`confirm_token`、`expires_in` 与 `risk_reason`，**不会执行**；请先向用户明确确认动作，再带同一个 `confirm_token` 重试。令牌**一次性**、绑定“实体 + 服务 + 参数”，默认 `DANGER_CONFIRM_TTL=120` 秒有效；令牌无效/过期/操作不匹配分别返回 `invalid_confirm_token` / `confirm_token_expired` / `confirm_token_mismatch`。
+
 ### 5.4 `list_services` — 查询设备能力（服务目录）
 
 让调用方先了解「某类/某个设备支持哪些服务、每个服务要什么参数」，再精确调用（能力自描述）。
@@ -207,13 +215,16 @@ python server.py
 | `entity` | string | 是 | 目标设备：entity_id 或友好名称 |
 | `service` | string | 是 | 服务名：`turn_on`（默认用设备 domain）或 `climate.set_hvac_mode`（显式带 domain 以它为准） |
 | `data` | object | 否 | 额外参数 JSON，如 `{"temperature":26}`、`{"hvac_mode":"heat"}`、`{"rgb_color":[255,0,0]}` |
+| `confirm_token` | string | 危险设备时 | 危险设备二次确认令牌，机制同 `control_device` |
 
 返回：`{ok,entity_id,name,service,response_kind,status,expected_state,before,after,changed,verified,verification,message}`
 `status` 四态同 `control_device`：`confirmed` / `no_change` / `mismatch` / `accepted_pending`；`verification` 含 `attempts`、`elapsed_ms`、`checks`、`mismatches`。
 
+> 危险设备保护与 `control_device` 相同：`lock`/`alarm_control_panel` 及车库门/门窗类 `cover` 的首次调用只返回 `confirmation_required` 与 `confirm_token`，确认后带 token 重试才执行。
+
 ### 5.6 `list_domains` — 获取设备类型
 
-无参数。返回 `{ok,domains:{light:3,switch:2,...},controllable_domains:["light","switch",...],message}`，便于了解家庭设备类别、哪些类型可控制，或选择 `domain` 过滤。
+无参数。返回 `{ok,domains:{light:3,switch:2,...},controllable_domains:["light","switch",...],dangerous_domains:["lock",...],message}`，便于了解家庭设备类别、哪些类型可控制、哪些类型需二次确认，或选择 `domain` 过滤。
 
 ---
 
@@ -275,10 +286,10 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 
 | 用户说 | 调用工具 | 参数 | 返回（节选） |
 |---|---|---|---|
-| 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":6,"count":6,"has_more":false,"devices":[...]}` |
+| 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":7,"count":7,"has_more":false,"devices":[...]}` |
 | 列出所有的灯 | `list_devices` | `{"domain":"light"}` | `total=1, devices=[{"name":"客厅灯","state":"off"}]` |
 | 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=3` |
-| 哪些设备能控制？ | `list_devices` | `{"controllable_only":true}` | `total=5`（自动排除只读 sensor） |
+| 哪些设备能控制？ | `list_devices` | `{"controllable_only":true}` | `total=6`（自动排除只读 sensor） |
 | 按物理设备看看家里有什么 | `list_devices` | `{"group_by":"device"}` | `devices=[{"name":"客厅环境组","entity_count":2,"controllable":true,"entities":[...]}] ` |
 | 家里有哪些类型的设备？ | `list_domains` | `{}` | `{"domains":{"light":1,"switch":1,...}}` |
 | 客厅灯现在开着吗？ | `get_device_state` | `{"entity":"客厅灯"}` | `{"ok":true,"entity":{"state":"off","attributes":{...}}}` |
@@ -287,6 +298,8 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | 空调调到 26 度 | `control_device` | `{"entity":"空调","action":"set_temperature","value":26}` | `{"ok":true,"service":"climate.set_temperature",...}` |
 | 电视音量调到 30 | `control_device` | `{"entity":"电视","action":"set_volume","value":30}` | `{"ok":true,"service":"media_player.volume_set",...}` |
 | 打开窗帘 | `control_device` | `{"entity":"窗帘","action":"open"}` | `{"ok":true,"service":"cover.open_cover","changed":true,"after":{"state":"open"}}` |
+| 打开大门门锁 | `control_device` | `{"entity":"大门门锁","action":"unlock"}` | `{"ok":false,"code":"confirmation_required","dangerous":true,"confirm_token":"...","expires_in":120}`（**未执行**） |
+| （用户确认后）打开大门门锁 | `control_device` | `{"entity":"大门门锁","action":"unlock","confirm_token":"..."}` | `{"ok":true,"status":"confirmed","after":{"state":"unlocked"}}` |
 | 空调能做什么操作？ | `list_services` | `{"entity":"空调"}` | `{"ok":true,"domain":"climate","service_count":4,"services":[{"service":"set_temperature","fields":[{"name":"temperature","required":true}]},...]}` |
 | 空调设成制热模式 | `call_service` | `{"entity":"空调","service":"climate.set_hvac_mode","data":{"hvac_mode":"heat"}}` | `{"ok":true,"status":"confirmed","after":{"state":"heat"}}` |
 | 把客厅灯切成暖光 | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"color_temp_kelvin":2700}}` | `{"ok":true,"status":"confirmed","verified":true,"verification":{"attempts":1,...}}` |
@@ -301,6 +314,8 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 {"ok": false, "code": "unsupported_action", "message": "不支持的控制动作：fly。可用动作：turn_on, turn_off, ..."}
 // 设备不可控制（如传感器）
 {"ok": false, "code": "not_controllable", "message": "『客厅温度』（sensor）不可控制：该类型无内置控制动作..."}
+// 危险设备未二次确认
+{"ok": false, "code": "confirmation_required", "dangerous": true, "confirm_token": "...", "expires_in": 120, "message": "『大门门锁』是危险设备..."}
 ```
 
 ---
@@ -324,6 +339,10 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | `invalid_service` | `call_service` 的 service 为空/格式错 | 用 `list_services` 查服务名，格式 `service` 或 `domain.service` |
 | `invalid_data` | `data` 不是 JSON 对象 | 传键值对对象，如 `{"temperature":26}` |
 | `no_services` | 指定 domain 无可用服务 | 核对 domain 或用 `list_services` 不带过滤查看 |
+| `confirmation_required` | 危险设备首次调用，未带 `confirm_token`（未执行） | 向用户确认后带返回的 `confirm_token` 重试 |
+| `invalid_confirm_token` | 令牌无效或已使用（一次性） | 重新发起原操作获取新令牌 |
+| `confirm_token_expired` | 令牌超过 `DANGER_CONFIRM_TTL` | 使用新返回的 `confirm_token`（已自动刷新） |
+| `confirm_token_mismatch` | 令牌与本次实体/服务/参数不匹配 | 重新发起原操作获取新令牌，勿改参数复用 |
 
 ### 8.2 排查步骤
 
@@ -346,6 +365,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
    可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
 8. **控制回读不符（status=mismatch）**：说明 HA 接受了调用、状态也变了，但属性未达目标（如设备不支持该亮度/温度范围）。
    核对 `list_services` 的字段与设备能力，必要时用 `get_device_state` 复查。
+9. **危险设备一直返回 `confirmation_required`**：这是防误操作设计，不是故障。把首次返回的 `confirm_token` 原样传入再次调用即可；若令牌过期，用新返回的 token。需要临时关闭可设 `DANGER_CONFIRM_ENABLED=false`（不建议）。
 
 > 已知 HA 行为：对**不存在的实体**调用 service 也会返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
 > 本服务在 `control_device` / `call_service` 后执行**状态+属性回读校验**：`response_kind`(states/empty/none)、`status`(confirmed/no_change/mismatch/accepted_pending)、`verified` 与 `verification`(checks/mismatches)，避免误报成功。
@@ -380,7 +400,7 @@ python server.py
 python tests/e2e_mcp_client.py
 ```
 
-`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，并内置「延迟生效（*_delayed）」「只改状态不改属性（turn_on_ignore_brightness）」两种场景，用于验证回读确认与 mismatch 识别；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。
+`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，并内置「延迟生效（*_delayed）」「只改状态不改属性（turn_on_ignore_brightness）」两种场景，用于验证回读确认与 mismatch 识别；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。P3 还内置 `lock.front_door`（大门门锁）与 `lock.lock`/`lock.unlock` 服务，端到端脚本会验证「首次 confirmation_required → 带 token 执行成功 → 复用/错误 token 被拒 → 意图不匹配被拒」全流程。
 
 ---
 
@@ -401,3 +421,4 @@ python tests/e2e_mcp_client.py
 - `HA_TOKEN` 仅环境变量注入，不写入镜像/代码；`.env` 不要提交到 Git（建议加入 `.gitignore`）。
 - 容器以非 root 用户（uid 10001）运行。
 - 建议仅在受信内网暴露 `8090`；如需公网访问，请前置反向代理并加鉴权/TLS。
+- 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。

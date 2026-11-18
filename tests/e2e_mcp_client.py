@@ -48,6 +48,7 @@ async def main():
                 ("list_services", {"domain": "light"}),
                 ("get_device_state", {"entity": "客厅灯"}),
                 ("get_device_state", {"entity": "sensor.living_temp"}),
+                ("get_device_state", {"entity": "大门门锁"}),
                 ("control_device", {"entity": "客厅灯", "action": "set_brightness", "value": 50}),
                 ("control_device", {"entity": "switch.fan", "action": "turn_on"}),
                 ("control_device", {"entity": "空调", "action": "set_temperature", "value": 26}),
@@ -86,6 +87,9 @@ async def main():
                         else:
                             print("   first_entity=" + str(first.get("entity_id")) + " controllable=" +
                                   str(first.get("controllable")) + " actions=" + str(first.get("actions")))
+                if name == "get_device_state" and isinstance(d, dict) and d.get("ok"):
+                    ent = d.get("entity") or {}
+                    print("   dangerous=" + str(ent.get("dangerous")) + " reason=" + str(ent.get("danger_reason")))
                 if name == "list_services" and isinstance(d, dict) and d.get("ok"):
                     print("   domains=" + str(d.get("domain_count")) + " services=" + str(d.get("service_count")))
                 if name in ("control_device", "call_service") and isinstance(d, dict) and d.get("ok"):
@@ -97,6 +101,34 @@ async def main():
                     if v.get("mismatches"):
                         print("   mismatches=" + json.dumps(v["mismatches"], ensure_ascii=False))
                     print("   before=" + json.dumps(d.get("before"), ensure_ascii=False) + " after=" + json.dumps(d.get("after"), ensure_ascii=False))
+
+            print("\n== P3 危险设备二次确认 ==")
+            first = await call(session, "control_device", {"entity": "大门门锁", "action": "unlock"})
+            d1 = first["data"] if isinstance(first["data"], dict) else {}
+            token = d1.get("confirm_token")
+            print("first code=" + str(d1.get("code")) + " dangerous=" + str(d1.get("dangerous")) +
+                  " token=" + str(bool(token)) + " expires_in=" + str(d1.get("expires_in")))
+            print("   msg=" + str(d1.get("message")))
+            second = await call(session, "control_device", {"entity": "大门门锁", "action": "unlock",
+                                                           "confirm_token": token})
+            d2 = second["data"] if isinstance(second["data"], dict) else {}
+            print("second ok=" + str(d2.get("ok")) + " status=" + str(d2.get("status")) +
+                  " state=" + str((d2.get("after") or {}).get("state")))
+            reuse = await call(session, "control_device", {"entity": "大门门锁", "action": "unlock",
+                                                          "confirm_token": token})
+            d3 = reuse["data"] if isinstance(reuse["data"], dict) else {}
+            print("reuse-token code=" + str(d3.get("code")))
+            bad = await call(session, "control_device", {"entity": "大门门锁", "action": "lock",
+                                                        "confirm_token": "bad-token"})
+            d4 = bad["data"] if isinstance(bad["data"], dict) else {}
+            print("bad-token code=" + str(d4.get("code")))
+            req = await call(session, "call_service", {"entity": "大门门锁", "service": "lock.lock"})
+            d5 = req["data"] if isinstance(req["data"], dict) else {}
+            tok2 = d5.get("confirm_token")
+            mismatch = await call(session, "call_service", {"entity": "大门门锁", "service": "lock.unlock",
+                                                           "confirm_token": tok2})
+            d6 = mismatch["data"] if isinstance(mismatch["data"], dict) else {}
+            print("mismatch code=" + str(d6.get("code")))
 
 
 if __name__ == "__main__":

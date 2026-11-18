@@ -21,13 +21,19 @@
   SERVICE_CONFIRM_RETRIES 服务调用后最少额外回读次数，默认 1
   SERVICE_CONFIRM_INTERVAL 回读轮询间隔秒数，默认同 SERVICE_CONFIRM_DELAY
   SERVICE_CONFIRM_TIMEOUT 回读确认总超时秒数，默认 4.0（窗口内持续轮询直到匹配预期）
+  DANGER_CONFIRM_ENABLED 是否对危险设备启用二次确认，默认 true
+  DANGER_CONFIRM_TTL     危险操作确认令牌有效期（秒），默认 120
+  DANGEROUS_DOMAINS      危险设备 domain 列表（逗号分隔），默认 lock,alarm_control_panel
+  DANGEROUS_COVER_CLASSES 危险 cover 的 device_class 列表，默认 garage,door,gate,window
   LOG_LEVEL     日志级别，默认 INFO
   DEFAULT_LIST_LIMIT / MAX_LIST_LIMIT  list_devices 默认/最大返回条数
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import secrets
 import time
 from typing import Any, Optional
 
@@ -42,6 +48,25 @@ SERVICE_CONFIRM_RETRIES = int(os.environ.get("SERVICE_CONFIRM_RETRIES", "1"))
 # 回读轮询间隔与总超时：在窗口内反复读取，直到状态/属性与预期一致
 SERVICE_CONFIRM_INTERVAL = float(os.environ.get("SERVICE_CONFIRM_INTERVAL", str(SERVICE_CONFIRM_DELAY)))
 SERVICE_CONFIRM_TIMEOUT = float(os.environ.get("SERVICE_CONFIRM_TIMEOUT", "4.0"))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_set(name: str, default: str) -> set:
+    raw = os.environ.get(name, default)
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+# 误操作防护：危险设备首次调用只返回确认令牌，用户确认后再带 token 调用才执行
+DANGER_CONFIRM_ENABLED = _env_bool("DANGER_CONFIRM_ENABLED", True)
+DANGER_CONFIRM_TTL = float(os.environ.get("DANGER_CONFIRM_TTL", "120"))
+DANGEROUS_DOMAINS = _env_set("DANGEROUS_DOMAINS", "lock,alarm_control_panel")
+DANGEROUS_COVER_CLASSES = _env_set("DANGEROUS_COVER_CLASSES", "garage,door,gate,window")
 
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "play",
@@ -84,6 +109,8 @@ mcp = FastMCP(
         "查询某类设备支持哪些服务与参数用 list_services；"
         "常规控制用 control_device（action 见工具描述，value 用于亮度/音量/温度等，"
         "控制后自动回读校验状态与属性）；"
+        "对 lock、alarm_control_panel 以及车库门/门窗类 cover 等危险设备的操作会先返回 "
+        "confirmation_required 与 confirm_token；必须让用户明确确认后，带 confirm_token 再调用一次；"
         "需要执行上述未覆盖的任意 HA 服务时用 call_service（服务名 + 参数 JSON）；"
         "不确定设备类型时先用 list_domains 查看有哪些类别。"
     ),
@@ -126,6 +153,93 @@ def summarize(st: dict) -> dict:
     }
 
 
+def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
+    """判断实体是否属于高风险设备（操作需二次确认）。"""
+    domain = _domain_of(entity_id)
+    if domain in DANGEROUS_DOMAINS:
+        return True, "该设备类型（" + domain + "）属于高风险设备"
+    if domain == "cover":
+        dc = str((attributes or {}).get("device_class") or "").strip().lower()
+        if dc in DANGEROUS_COVER_CLASSES:
+            return True, "该 cover 设备类型（" + dc + "）属于高风险（门窗/车库等）"
+    return False, None
+
+
+def _danger_info(entity_id: str, attributes: Optional[dict]) -> dict:
+    dangerous, reason = _danger_flags(entity_id, attributes)
+    return {"dangerous": dangerous, "danger_reason": reason}
+
+
+_CONFIRM_TOKENS: dict = {}
+
+
+def _prune_confirm_tokens() -> None:
+    now = time.monotonic()
+    for token in [k for k, v in _CONFIRM_TOKENS.items() if float(v.get("expires_at", 0)) <= now]:
+        _CONFIRM_TOKENS.pop(token, None)
+
+
+def _confirm_intent(service_domain: str, service: str, payload: dict) -> str:
+    try:
+        body = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        body = str(payload)
+    return str(service_domain) + "." + str(service) + "|" + body
+
+
+def _issue_confirm_token(entity_id: str, service_domain: str, service: str, payload: dict) -> str:
+    _prune_confirm_tokens()
+    token = secrets.token_urlsafe(12)
+    _CONFIRM_TOKENS[token] = {
+        "intent": _confirm_intent(service_domain, service, payload),
+        "entity_id": entity_id,
+        "service": str(service_domain) + "." + str(service),
+        "expires_at": time.monotonic() + max(1.0, DANGER_CONFIRM_TTL),
+    }
+    return token
+
+
+def _danger_block(st: dict, service_domain: str, service: str,
+                  payload: dict, confirm_token: Optional[str]) -> Optional[dict]:
+    """危险设备二次确认闸门：返回拦截结果；非危险或确认通过返回 None。"""
+    if not DANGER_CONFIRM_ENABLED:
+        return None
+    eid = str(st.get("entity_id"))
+    dangerous, reason = _danger_flags(eid, st.get("attributes") or {})
+    if not dangerous:
+        return None
+    name = _friendly_name(st)
+    svc_str = str(service_domain) + "." + str(service)
+    expected_intent = _confirm_intent(service_domain, service, payload)
+    ttl = max(1, int(round(DANGER_CONFIRM_TTL)))
+    base = {"ok": False, "dangerous": True, "requires_confirmation": True,
+            "entity_id": eid, "name": name, "service": svc_str,
+            "risk_reason": reason}
+    token = (confirm_token or "").strip()
+    if not token:
+        new_token = _issue_confirm_token(eid, service_domain, service, payload)
+        return {**base, "code": "confirmation_required",
+                "confirm_token": new_token, "expires_in": ttl,
+                "message": "『" + name + "』是危险设备（" + str(reason) + "），为避免误操作未执行。"
+                           "请先向用户明确确认动作，确认后再带上 confirm_token 调用一次；"
+                           "令牌 " + str(ttl) + " 秒内有效且仅可使用一次。"}
+    rec = _CONFIRM_TOKENS.get(token)
+    if rec is None:
+        return {**base, "code": "invalid_confirm_token",
+                "message": "确认令牌无效或已使用。请重新发起原操作获取新的 confirm_token，并在用户确认后使用。"}
+    if float(rec.get("expires_at", 0)) <= time.monotonic():
+        _CONFIRM_TOKENS.pop(token, None)
+        new_token = _issue_confirm_token(eid, service_domain, service, payload)
+        return {**base, "code": "confirm_token_expired", "confirm_token": new_token,
+                "expires_in": ttl,
+                "message": "确认令牌已过期。已生成新的 confirm_token；请让用户确认后重新调用。"}
+    if rec.get("intent") != expected_intent:
+        return {**base, "code": "confirm_token_mismatch",
+                "message": "确认令牌与本次操作不匹配（设备、服务或参数已变化）。请重新发起原操作获取新的 confirm_token。"}
+    _CONFIRM_TOKENS.pop(token, None)  # 一次性：校验通过即消费
+    return None
+
+
 def _controllability(entity_id: str, state: Any) -> dict:
     """判断一个实体是否可控制，并给出内置动作列表。"""
     domain = _domain_of(entity_id)
@@ -163,6 +277,7 @@ def _entity_view(st: dict, devices: dict, ents: dict) -> dict:
     """在实体摘要基础上补充 controllable 标记与所属设备信息。"""
     v = summarize(st)
     v.update(_controllability(st.get("entity_id", ""), st.get("state")))
+    v.update(_danger_info(st.get("entity_id", ""), st.get("attributes") or {}))
     eid = str(st.get("entity_id", ""))
     re = ents.get(eid) or {}
     did = re.get("device_id")
@@ -190,6 +305,7 @@ def _group_by_device(views: list, devices: dict) -> list:
                 "model": (d.get("model") if d else None),
                 "area_id": (d.get("area_id") if d else None) or v.get("area_id"),
                 "controllable": False,
+                "dangerous": False,
                 "entity_count": 0,
                 "entities": [],
             }
@@ -199,6 +315,8 @@ def _group_by_device(views: list, devices: dict) -> list:
         g["entity_count"] += 1
         if v.get("controllable"):
             g["controllable"] = True
+        if v.get("dangerous"):
+            g["dangerous"] = True
     return [groups[k] for k in order]
 
 
@@ -235,6 +353,7 @@ _EXPECTED_STATE = {
     "open_cover": "open", "close_cover": "closed",
     "start": "on", "stop": "off",
     "media_play": "playing", "media_pause": "paused", "media_stop": "idle",
+    "lock": "locked", "unlock": "unlocked",
 }
 
 
@@ -686,7 +805,8 @@ async def get_device_state(entity: str) -> dict:
 
 
 @mcp.tool()
-async def control_device(entity: str, action: str, value: Optional[float] = None) -> dict:
+async def control_device(entity: str, action: str, value: Optional[float] = None,
+                         confirm_token: Optional[str] = None) -> dict:
     """控制设备（开关、亮度、音量、温度、颜色等）。
 
     参数：
@@ -702,6 +822,9 @@ async def control_device(entity: str, action: str, value: Optional[float] = None
         set_color_temp     value=色温（开尔文，light）
         set_color          value=颜色 #RRGGBB 或 "r,g,b"（light）
       value   数字参数，按 action 需要提供。
+      confirm_token 危险设备二次确认令牌。门锁/安防面板/车库门等危险设备首次调用会返回
+                   code=confirmation_required 与 confirm_token（不执行）；用户确认后带上该
+                   token 再调用一次才真正执行。令牌一次性且绑定本次操作。
 
     控制后会在超时窗口内轮询回读，校验状态 + 亮度/温度/音量/颜色等属性是否达到预期，
     返回 verified 与 verification（attempts/checks/mismatches/elapsed_ms）。
@@ -730,6 +853,9 @@ async def control_device(entity: str, action: str, value: Optional[float] = None
         sd, svc, extra = build_service(action, domain, value)
         payload = {"entity_id": eid}
         payload.update(extra)
+        guard = _danger_block(st, sd, svc, payload, confirm_token)
+        if guard is not None:
+            return guard
         result = await _apply_and_confirm(ha, st, sd, svc, payload, action)
         result["ok"] = True
         result["action"] = action
@@ -837,7 +963,8 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
 
 
 @mcp.tool()
-async def call_service(entity: str, service: str, data: Optional[dict] = None) -> dict:
+async def call_service(entity: str, service: str, data: Optional[dict] = None,
+                      confirm_token: Optional[str] = None) -> dict:
     """通用服务调用：对任意设备执行 Home Assistant 的任意服务（覆盖 control_device 未封装的场景）。
 
     参数：
@@ -846,6 +973,8 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None) -
               （显式带 domain 时以该 domain 为准）。可用 list_services 查询可用服务名。
       data    额外参数（JSON 对象），如 {"brightness":128}、{"temperature":26}、
               {"hvac_mode":"heat"}、{"rgb_color":[255,0,0]}；无需参数时省略。
+      confirm_token 危险设备二次确认令牌，机制同 control_device：对 lock/alarm_control_panel
+              及车库门/门窗类 cover 等危险设备的服务调用，首次只返回确认令牌不执行。
 
     返回状态回读校验结果（verified / verification）：
       status=confirmed        回读确认状态/属性已达到预期
@@ -887,6 +1016,9 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None) -
                     "message": "data 必须是 JSON 对象（键值对），收到：" + str(type(data).__name__)}
         payload = {"entity_id": eid}
         payload.update(extra)
+        guard = _danger_block(st, service_domain, svc, payload, confirm_token)
+        if guard is not None:
+            return guard
         result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
         result["ok"] = True
         return result
@@ -919,10 +1051,14 @@ async def list_domains() -> dict:
                 counts[d] = counts.get(d, 0) + 1
         counts = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
         ctrl = [d for d in counts if DOMAIN_ACTIONS.get(d)]
+        danger = [d for d in counts if d in DANGEROUS_DOMAINS]
         msg = "共 " + str(len(counts)) + " 种设备类型：" + ", ".join(k + "(" + str(v) + ")" for k, v in counts.items())
         if ctrl:
             msg += "；可控类型：" + ", ".join(ctrl)
-        return {"ok": True, "domains": counts, "controllable_domains": ctrl, "message": msg}
+        if danger:
+            msg += "；需二次确认的危险类型：" + ", ".join(danger)
+        return {"ok": True, "domains": counts, "controllable_domains": ctrl,
+                "dangerous_domains": danger, "message": msg}
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": _hint()}
     except Exception as e:  # noqa: BLE001

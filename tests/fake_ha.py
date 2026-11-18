@@ -56,6 +56,11 @@ STATES = {
         "attributes": {"friendly_name": "窗帘", "current_position": 0},
         "last_changed": "2026-01-01T00:00:00+00:00", "last_updated": "2026-01-01T00:00:00+00:00",
     },
+    "lock.front_door": {
+        "entity_id": "lock.front_door", "state": "locked",
+        "attributes": {"friendly_name": "大门门锁"},
+        "last_changed": "2026-01-01T00:00:00+00:00", "last_updated": "2026-01-01T00:00:00+00:00",
+    },
 }
 
 # 延迟生效队列：模拟设备状态在服务调用后若干次轮询才真正变化
@@ -103,6 +108,10 @@ SERVICES = [
         "close_cover": {"name": "关闭", "description": "Close the cover", "fields": {}},
         "stop_cover": {"name": "停止", "description": "Stop the cover", "fields": {}},
     }},
+    {"domain": "lock", "services": {
+        "lock": {"name": "上锁", "description": "Lock the door", "fields": {}},
+        "unlock": {"name": "开锁", "description": "Unlock the door", "fields": {}},
+    }},
 ]
 
 
@@ -118,6 +127,8 @@ DEVICE_REGISTRY = [
      "model": "TV-4K", "model_id": "TV4K", "area_id": "living_room", "disabled_by": None},
     {"id": "dev_curtain", "name": "窗帘", "name_by_user": None, "manufacturer": "HomeAuto",
      "model": "C1", "model_id": "C1", "area_id": "living_room", "disabled_by": None},
+    {"id": "dev_lock", "name": "大门门锁", "name_by_user": None, "manufacturer": "SafeCo",
+     "model": "L1", "model_id": "L1", "area_id": "entrance", "disabled_by": None},
 ]
 ENTITY_REGISTRY = [
     {"entity_id": "light.living_room", "device_id": "dev_living", "area_id": None,
@@ -131,6 +142,8 @@ ENTITY_REGISTRY = [
     {"entity_id": "media_player.tv", "device_id": "dev_tv", "area_id": None,
      "disabled_by": None, "hidden_by": None},
     {"entity_id": "cover.curtain", "device_id": "dev_curtain", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "lock.front_door", "device_id": "dev_lock", "area_id": None,
      "disabled_by": None, "hidden_by": None},
 ]
 
@@ -168,6 +181,10 @@ def apply_service(domain, service, body):
             target = "open"
         elif base in ("turn_off", "close_cover", "media_stop"):
             target = "off"
+        elif base == "lock":
+            target = "locked"
+        elif base == "unlock":
+            target = "unlocked"
         else:
             target = "on"
         PENDING[eid] = {"state": target, "remaining": 2}
@@ -211,6 +228,10 @@ def apply_service(domain, service, body):
         st["state"] = "playing"
     elif service == "media_pause":
         st["state"] = "paused"
+    elif service == "lock":
+        st["state"] = "locked"
+    elif service == "unlock":
+        st["state"] = "unlocked"
     after = _state_sig(st)
     if after != before:
         return [dict(st)]
