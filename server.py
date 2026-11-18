@@ -14,11 +14,14 @@
   MCP_SSE_PATH  sse 路径，默认 /sse
   HA_TIMEOUT    HA 请求超时秒数，默认 10
   HA_VERIFY_SSL 是否校验 HA 的 TLS 证书，默认 true
+  SERVICE_CONFIRM_DELAY   服务调用后回读前的等待秒数，默认 0.6
+  SERVICE_CONFIRM_RETRIES 服务调用后回读的重试次数，默认 1
   LOG_LEVEL     日志级别，默认 INFO
   DEFAULT_LIST_LIMIT / MAX_LIST_LIMIT  list_devices 默认/最大返回条数
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, Optional
 
@@ -28,6 +31,8 @@ from ha_client import HAError, HAClient
 
 DEFAULT_LIST_LIMIT = int(os.environ.get("DEFAULT_LIST_LIMIT", "50"))
 MAX_LIST_LIMIT = int(os.environ.get("MAX_LIST_LIMIT", "500"))
+SERVICE_CONFIRM_DELAY = float(os.environ.get("SERVICE_CONFIRM_DELAY", "0.6"))
+SERVICE_CONFIRM_RETRIES = int(os.environ.get("SERVICE_CONFIRM_RETRIES", "1"))
 
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "play",
@@ -47,7 +52,9 @@ mcp = FastMCP(
         "把 Home Assistant 的智能家居设备封装为 MCP 工具。"
         "查看设备用 list_devices（可按 keyword 名称关键字或 domain 设备类型过滤，支持分页）；"
         "查看单个设备状态用 get_device_state（entity 可传 entity_id 或中文名称）；"
-        "控制设备用 control_device（action 见工具描述，value 用于亮度/音量/温度等）；"
+        "查询某类设备支持哪些服务与参数用 list_services；"
+        "常规控制用 control_device（action 见工具描述，value 用于亮度/音量/温度等）；"
+        "需要执行上述未覆盖的任意 HA 服务时用 call_service（服务名 + 参数 JSON）；"
         "不确定设备类型时先用 list_domains 查看有哪些类别。"
     ),
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
@@ -98,6 +105,117 @@ def snapshot(st: Optional[dict]) -> Optional[dict]:
         if k in a:
             d[k] = a[k]
     return d
+
+
+def _classify_service_response(resp: Any) -> str:
+    """把 HA service 调用的返回体归类为三态之一。
+
+    - states : 非空数组/对象（旧版 HA 返回受影响的实体状态，或 return_response 有数据）
+    - empty  : 空数组 []（调用被接受，但没有任何状态变化）
+    - none   : null（新版 HA 不返回调用结果，需乐观推断 + 延迟回读确认）
+    """
+    if resp is None:
+        return "none"
+    if isinstance(resp, list):
+        return "states" if len(resp) > 0 else "empty"
+    if isinstance(resp, dict):
+        return "states" if resp else "empty"
+    return "none"
+
+
+# 通用服务 -> 乐观预期状态（HA 不返回结果时，告诉调用方“预期会变成什么”）
+_EXPECTED_STATE = {
+    "turn_on": "on", "turn_off": "off",
+    "open_cover": "open", "close_cover": "closed",
+    "start": "on", "stop": "off",
+    "media_play": "playing", "media_pause": "paused", "media_stop": "idle",
+}
+
+
+def _expected_state(service: str, before_state: Optional[str]) -> Optional[str]:
+    svc = (service or "").strip().lower()
+    if svc == "toggle":
+        if before_state == "on":
+            return "off"
+        if before_state == "off":
+            return "on"
+        return None
+    return _EXPECTED_STATE.get(svc)
+
+
+def _field_brief(fname: str, fdef: dict) -> dict:
+    """把 HA 服务参数字段压缩成便于大模型理解的说明。"""
+    fdef = fdef or {}
+    sel = fdef.get("selector") or {}
+    sel_type = next(iter(sel.keys()), None) if isinstance(sel, dict) else None
+    out = {"name": fname, "required": bool(fdef.get("required"))}
+    if fdef.get("description"):
+        out["description"] = fdef["description"]
+    if sel_type:
+        out["selector"] = sel_type
+    if "example" in fdef:
+        out["example"] = fdef["example"]
+    return out
+
+
+async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
+                             service: str, payload: dict, action_label: str) -> dict:
+    """执行一次 HA 服务调用，并用「三态返回 + 乐观推断 + 延迟回读」确认效果。
+
+    status 语义：
+      confirmed        已确认状态发生变化（回读到 after != before）
+      no_change        HA 返回空数组，调用被接受但无状态变化（如已是目标状态/设备不支持）
+      accepted_pending HA 返回 null（新版 HA），已下发但尚未观察到变化，附乐观预期状态
+    """
+    eid = str(st.get("entity_id"))
+    before = snapshot(st)
+    resp = await ha.call_service(service_domain, service, payload)
+    resp_kind = _classify_service_response(resp)
+    expected = _expected_state(service, (st.get("state") if st else None))
+
+    after = None
+    changed = False
+    attempts = max(0, int(SERVICE_CONFIRM_RETRIES)) + 1
+    for _i in range(attempts):
+        if SERVICE_CONFIRM_DELAY > 0:
+            await asyncio.sleep(SERVICE_CONFIRM_DELAY)
+        try:
+            after_st = await ha.get_state(eid)
+        except HAError:
+            after_st = None
+        after = snapshot(after_st)
+        changed = after is not None and after != before
+        if changed:
+            break
+
+    if changed:
+        status = "confirmed"
+    elif resp_kind in ("empty", "states"):
+        status = "no_change"
+    else:  # none
+        status = "accepted_pending"
+
+    svc_str = service_domain + "." + service
+    name = _friendly_name(st)
+    msg = "已对 " + name + " 执行 " + str(action_label) + "（服务 " + svc_str + "）"
+    if after is not None:
+        msg += "，当前状态：" + str(after.get("state"))
+    if status == "confirmed":
+        msg += "。"
+    elif status == "no_change":
+        msg += "。注意：HA 已接受调用，但未观察到状态变化——设备可能不支持该操作或当前已是目标状态。"
+    else:  # accepted_pending
+        msg += "。HA 未返回调用结果（新版 HA 常见），已下发但暂未观察到变化"
+        if expected:
+            msg += "，预期变为：" + expected
+        msg += "；若稍后仍未变化，可用 get_device_state 复查。"
+
+    return {
+        "entity_id": eid, "name": name, "service": svc_str,
+        "response_kind": resp_kind, "status": status,
+        "expected_state": expected, "before": before, "after": after,
+        "changed": changed, "message": msg,
+    }
 
 
 def _need_value(action: str, value: Any) -> None:
@@ -335,30 +453,175 @@ async def control_device(entity: str, action: str, value: Optional[float] = None
         sd, svc, extra = build_service(action, domain, value)
         payload = {"entity_id": eid}
         payload.update(extra)
-        before = snapshot(st)
-        await ha.call_service(sd, svc, payload)
-        # 回读复核（HA 对不存在实体也可能返回 200，必须靠回读判断真实效果）
-        after_st = None
-        try:
-            after_st = await ha.get_state(eid)
-        except HAError:
-            after_st = None
-        after = snapshot(after_st)
-        changed = after is not None and after != before
-        msg = "已对 " + _friendly_name(st) + " 执行 " + str(action) + "（服务 " + sd + "." + svc + "）"
-        if after is not None:
-            msg += "，当前状态：" + str(after.get("state"))
-            if not changed:
-                msg += "。注意：服务调用已被 HA 接受，但未观察到状态变化——该设备可能不支持此操作或当前已是该状态。"
-        return {
-            "ok": True, "entity_id": eid, "name": _friendly_name(st),
-            "action": action, "service": sd + "." + svc,
-            "before": before, "after": after, "changed": changed, "message": msg,
-        }
+        result = await _apply_and_confirm(ha, st, sd, svc, payload, action)
+        result["ok"] = True
+        result["action"] = action
+        return result
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "code": "internal_error", "message": "控制设备失败：" + str(e)}
+
+
+@mcp.tool()
+async def list_services(entity: Optional[str] = None, domain: Optional[str] = None,
+                        keyword: Optional[str] = None, detailed: bool = False) -> dict:
+    """查询 Home Assistant 中某类设备/某个设备支持的服务（能力）及参数。
+
+    这是“能力自描述”工具：让调用方在不了解设备细节时，先查清能对这个设备做什么、
+    每个服务需要什么参数，再用 call_service 精确调用。
+
+    参数：
+      entity   可选，设备 entity_id 或友好名称；给出时只返回该设备所属 domain 的服务。
+      domain   可选，直接指定设备类型（如 light/climate/media_player/cover/vacuum）。
+      keyword  可选，按服务名或描述关键字过滤（如 "temperature"）。
+      detailed 是否返回每个服务的字段参数明细（默认：指定 entity/domain 时为 true，否则仅名称）。
+    返回：domain 列表及每个 domain 的服务名/描述/字段。
+
+    适用场景：「空调能做什么操作」「灯支持调色温吗」「这个设备有哪些可控项」。
+    """
+    try:
+        ha = get_ha()
+        catalog = await ha.get_services()
+        target = None
+        if entity:
+            st, cands = await ha.resolve_entity(entity)
+            if st is None:
+                if cands:
+                    return {"ok": False, "code": "ambiguous",
+                            "message": "『" + str(entity) + "』匹配到多个设备，请指定更精确名称或 entity_id。",
+                            "candidates": [str(c.get("entity_id")) for c in cands[:10]]}
+                return {"ok": False, "code": "not_found",
+                        "message": "未找到设备『" + str(entity) + "』。可先用 list_devices 查询。"}
+            target = _domain_of(str(st.get("entity_id")))
+        elif domain:
+            target = domain.strip().lower()
+
+        kw = (keyword or "").strip().lower()
+        detailed = bool(detailed) or bool(target)
+
+        def match(svc_name: str, svc_def: dict) -> bool:
+            if not kw:
+                return True
+            svc_def = svc_def or {}
+            text = (svc_name + " " + str(svc_def.get("description", "")) + " " +
+                    str(svc_def.get("name", ""))).lower()
+            return kw in text
+
+        domains_out = []
+        service_total = 0
+        for entry in catalog:
+            d = str((entry or {}).get("domain", ""))
+            if not d:
+                continue
+            if target and d != target:
+                continue
+            services = (entry or {}).get("services") or {}
+            if not isinstance(services, dict):
+                continue
+            svc_list = []
+            for sname, sdef in services.items():
+                if not match(sname, sdef):
+                    continue
+                item = {"service": sname}
+                if isinstance(sdef, dict):
+                    if sdef.get("name"):
+                        item["name"] = sdef["name"]
+                    if sdef.get("description"):
+                        item["description"] = sdef["description"]
+                    if detailed:
+                        fields = sdef.get("fields") or {}
+                        if isinstance(fields, dict) and fields:
+                            item["fields"] = [_field_brief(fn, fd) for fn, fd in fields.items()]
+                svc_list.append(item)
+            if svc_list:
+                svc_list.sort(key=lambda x: x["service"])
+                service_total += len(svc_list)
+                domains_out.append({
+                    "domain": d,
+                    "service_count": len(svc_list),
+                    "services": svc_list if detailed else [x["service"] for x in svc_list],
+                })
+
+        if target and not domains_out:
+            return {"ok": False, "code": "no_services",
+                    "message": "没有找到 domain=『" + str(target) + "』的服务（或该设备类型无可用服务）。"}
+        domains_out.sort(key=lambda x: x["domain"])
+        if target:
+            msg = "domain=「" + str(target) + "」共 " + str(service_total) + " 个服务。"
+        else:
+            msg = "共 " + str(len(domains_out)) + " 个 domain、" + str(service_total) + " 个服务。"
+        return {"ok": True, "domain": target, "domain_count": len(domains_out),
+                "service_count": service_total, "domains": domains_out, "message": msg}
+    except HAError as e:
+        return {"ok": False, **e.to_dict(), "hint": _hint()}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": "internal_error", "message": "查询服务列表失败：" + str(e)}
+
+
+@mcp.tool()
+async def call_service(entity: str, service: str, data: Optional[dict] = None) -> dict:
+    """通用服务调用：对任意设备执行 Home Assistant 的任意服务（覆盖 control_device 未封装的场景）。
+
+    参数：
+      entity  目标设备：entity_id 或友好名称（会先精确/模糊匹配）。
+      service 服务名，可写 "turn_on"（默认用设备所属 domain），或 "climate.set_hvac_mode"
+              （显式带 domain 时以该 domain 为准）。可用 list_services 查询可用服务名。
+      data    额外参数（JSON 对象），如 {"brightness":128}、{"temperature":26}、
+              {"hvac_mode":"heat"}、{"rgb_color":[255,0,0]}；无需参数时省略。
+
+    返回三态结果：
+      status=confirmed        已确认状态发生变化
+      status=no_change        HA 返回空数组，调用被接受但无状态变化
+      status=accepted_pending HA 返回 null（新版 HA），已下发但未观察到变化，附乐观预期状态
+    适用场景：「把空调设成制热模式」「灯切成暖光」「设置风扇风速」「执行自定义脚本」。
+    """
+    try:
+        ha = get_ha()
+        st, cands = await ha.resolve_entity(entity)
+        if st is None:
+            if cands:
+                return {"ok": False, "code": "ambiguous",
+                        "message": "『" + str(entity) + "』匹配到多个设备，无法确定控制目标，请指定更精确名称或 entity_id。",
+                        "candidates": [str(c.get("entity_id")) for c in cands[:10]]}
+            return {"ok": False, "code": "not_found",
+                    "message": "未找到设备『" + str(entity) + "』，无法调用服务。可先用 list_devices 查询。"}
+        eid = str(st.get("entity_id"))
+        spec = (service or "").strip()
+        if not spec:
+            return {"ok": False, "code": "invalid_service", "message": "service 不能为空。"}
+        if "." in spec:
+            service_domain, svc = spec.split(".", 1)
+            service_domain = service_domain.strip()
+            svc = svc.strip()
+        else:
+            service_domain = _domain_of(eid)
+            svc = spec
+        if not service_domain or not svc:
+            return {"ok": False, "code": "invalid_service",
+                    "message": "服务名格式应为 'service' 或 'domain.service'，收到：" + str(service)}
+        if data is None:
+            extra = {}
+        elif isinstance(data, dict):
+            extra = dict(data)
+        else:
+            return {"ok": False, "code": "invalid_data",
+                    "message": "data 必须是 JSON 对象（键值对），收到：" + str(type(data).__name__)}
+        payload = {"entity_id": eid}
+        payload.update(extra)
+        result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
+        result["ok"] = True
+        return result
+    except HAError as e:
+        out = {"ok": False, **e.to_dict()}
+        if e.code in ("not_found", "http_error", "upstream_error"):
+            out["hint"] = ("该服务可能不存在或参数不匹配。可先用 list_services(domain=…) 查询支持的服"
+                           "务与字段，再核对 data 参数名。")
+        else:
+            out["hint"] = _hint()
+        return out
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": "internal_error", "message": "调用服务失败：" + str(e)}
 
 
 @mcp.tool()

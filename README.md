@@ -3,7 +3,8 @@
 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言调用，支持 Docker 一键部署。
 
-> 核心特性：配置只走环境变量（不硬编码）、只读/控制一体化、控制后自动回读复核、
+> 核心特性：配置只走环境变量（不硬编码）、只读/控制一体化、服务能力自描述（`list_services`）、
+> 通用服务调用（`call_service`，覆盖任意 HA 服务）、控制后三态回读复核（confirmed/no_change/accepted_pending）、
 > 错误全部转为中文可读提示且服务不崩溃、设备列表支持过滤与分页。
 
 ---
@@ -29,7 +30,7 @@
 
 ```
 ha-mcp/
-├── server.py                              # MCP 服务 + 4 个工具
+├── server.py                              # MCP 服务 + 6 个工具
 ├── ha_client.py                           # HA REST 客户端 / 错误处理 / 实体解析
 ├── requirements.txt
 ├── Dockerfile
@@ -64,6 +65,8 @@ ha-mcp/
 | `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `DEFAULT_LIST_LIMIT` | | `50` | `list_devices` 默认每页条数 |
 | `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数（防止一次返回过多） |
+| `SERVICE_CONFIRM_DELAY` | | `0.6` | 服务调用后回读前的等待秒数（等待设备状态刷新） |
+| `SERVICE_CONFIRM_RETRIES` | | `1` | 服务调用后回读的额外重试次数 |
 
 > 安全：`HA_TOKEN` 只通过环境变量注入，不写入镜像、不写入代码、不写进 Git。
 
@@ -160,10 +163,37 @@ python server.py
 | `set_color_temp` | 设置色温（light） | 开尔文 |
 | `set_color` | 设置颜色（light） | `#RRGGBB` 或 `"r,g,b"` |
 
-返回：`{ok,entity_id,name,action,service,before,after,changed,message}`
-**控制后会回读设备状态**：若 HA 接受调用但状态未变化，`message` 会提示「未观察到状态变化」——避免 HA「对不存在实体也返回 200」造成的静默假成功。
+返回：`{ok,entity_id,name,action,service,response_kind,status,expected_state,before,after,changed,message}`
+**控制后三态回读复核**：`status` 为 `confirmed`（确认已变化）/ `no_change`（HA 返回空数组，调用被接受但无变化）/ `accepted_pending`（HA 返回 null，新版 HA 常见，已下发但未观察到变化，附 `expected_state` 乐观预期）。据此避免 HA「对不存在实体也返回 200」造成的静默假成功。
 
-### 5.4 `list_domains` — 获取设备类型
+### 5.4 `list_services` — 查询设备能力（服务目录）
+
+让调用方先了解「某类/某个设备支持哪些服务、每个服务要什么参数」，再精确调用（能力自描述）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `entity` | string | 否 | 设备 entity_id 或友好名称；给出时只返回该设备所属 domain 的服务 |
+| `domain` | string | 否 | 直接指定设备类型（如 `light`/`climate`/`media_player`） |
+| `keyword` | string | 否 | 按服务名或描述关键字过滤（如 `temperature`） |
+| `detailed` | bool | 否 | 是否返回字段参数明细（指定 entity/domain 时默认 true，否则仅名称） |
+
+返回：`{ok,domain,domain_count,service_count,domains:[{domain,service_count,services:[{service,name?,description?,fields?:[{name,required,selector?,example?}]}]}],message}`
+数据源为 HA `GET /api/services`。
+
+### 5.5 `call_service` — 通用服务调用
+
+执行 `control_device` 未封装的任意 HA 服务（如空调模式、风扇风速、自定义脚本）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `entity` | string | 是 | 目标设备：entity_id 或友好名称 |
+| `service` | string | 是 | 服务名：`turn_on`（默认用设备 domain）或 `climate.set_hvac_mode`（显式带 domain 以它为准） |
+| `data` | object | 否 | 额外参数 JSON，如 `{"temperature":26}`、`{"hvac_mode":"heat"}`、`{"rgb_color":[255,0,0]}` |
+
+返回：`{ok,entity_id,name,service,response_kind,status,expected_state,before,after,changed,message}`
+`status` 三态同 `control_device`：`confirmed` / `no_change` / `accepted_pending`。
+
+### 5.6 `list_domains` — 获取设备类型
 
 无参数。返回 `{ok,domains:{light:3,switch:2,...},message}`，便于了解家庭设备类别或选择 `domain` 过滤。
 
@@ -204,7 +234,7 @@ python server.py
 ```bash
 cd deploy && docker compose restart xiaozhi-esp32-server
 docker logs xiaozhi-esp32-server 2>&1 | grep -i "MCP"
-# 期望看到：初始化服务端MCP客户端: ha  ...  可用工具: ['list_devices','get_device_state','control_device','list_domains']
+# 期望看到：初始化服务端MCP客户端: ha  ...  可用工具: ['list_devices','get_device_state','control_device','list_services','call_service','list_domains']
 ```
 
 4. 之后用户在语音里提到的设备操作，会被 LLM 自动路由到上述工具。
@@ -237,6 +267,9 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | 空调调到 26 度 | `control_device` | `{"entity":"空调","action":"set_temperature","value":26}` | `{"ok":true,"service":"climate.set_temperature",...}` |
 | 电视音量调到 30 | `control_device` | `{"entity":"电视","action":"set_volume","value":30}` | `{"ok":true,"service":"media_player.volume_set",...}` |
 | 打开窗帘 | `control_device` | `{"entity":"窗帘","action":"open"}` | `{"ok":true,"service":"cover.open_cover","changed":true,"after":{"state":"open"}}` |
+| 空调能做什么操作？ | `list_services` | `{"entity":"空调"}` | `{"ok":true,"domain":"climate","service_count":4,"services":[{"service":"set_temperature","fields":[{"name":"temperature","required":true}]},...]}` |
+| 空调设成制热模式 | `call_service` | `{"entity":"空调","service":"climate.set_hvac_mode","data":{"hvac_mode":"heat"}}` | `{"ok":true,"status":"confirmed","after":{"state":"heat"}}` |
+| 把客厅灯切成暖光 | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"color_temp_kelvin":2700}}` | `{"ok":true,"status":"confirmed"}` |
 
 失败示例（清晰提示，不崩溃）：
 
@@ -264,6 +297,9 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | `ambiguous` | 名称匹配到多个设备 | 改用更精确名称或 entity_id |
 | `missing_value` / `invalid_value` | 动作缺参数或取值越界 | 按工具描述传 1-100 等合法值 |
 | `unsupported_action` | 动作不支持 | 使用 `SUPPORTED_ACTIONS` 中的动作 |
+| `invalid_service` | `call_service` 的 service 为空/格式错 | 用 `list_services` 查服务名，格式 `service` 或 `domain.service` |
+| `invalid_data` | `data` 不是 JSON 对象 | 传键值对对象，如 `{"temperature":26}` |
+| `no_services` | 指定 domain 无可用服务 | 核对 domain 或用 `list_services` 不带过滤查看 |
 
 ### 8.2 排查步骤
 
@@ -282,8 +318,8 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 5. **TLS**：自签名证书导致 `SSLError` 时设 `HA_VERIFY_SSL=false`（仅受信网络）。
 6. **代理**：若宿主设置了 `HTTP_PROXY/NO_PROXY` 干扰直连，保持 `HA_TRUST_ENV=false`（默认）。
 
-> 已知 HA 行为：对**不存在的实体**调用 service 也会返回 HTTP 200（响应为空）。
-> 本服务在 `control_device` 后**强制回读**，用 `changed` 和 `message` 暴露「未观察到变化」，避免误报成功。
+> 已知 HA 行为：对**不存在的实体**调用 service 也会返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
+> 本服务在 `control_device` / `call_service` 后执行**三态回读复核**：`response_kind`(states/empty/none) + `status`(confirmed/no_change/accepted_pending) + `changed`，避免误报成功。
 
 ---
 

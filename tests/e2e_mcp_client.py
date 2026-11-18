@@ -41,6 +41,8 @@ async def main():
                 ("list_devices", {"domain": "light"}),
                 ("list_devices", {"keyword": "客厅"}),
                 ("list_domains", {}),
+                ("list_services", {}),
+                ("list_services", {"domain": "light"}),
                 ("get_device_state", {"entity": "客厅灯"}),
                 ("get_device_state", {"entity": "sensor.living_temp"}),
                 ("control_device", {"entity": "客厅灯", "action": "set_brightness", "value": 50}),
@@ -50,6 +52,11 @@ async def main():
                 ("control_device", {"entity": "电视", "action": "set_volume", "value": 30}),
                 ("control_device", {"entity": "不存在设备", "action": "turn_on"}),
                 ("control_device", {"entity": "客厅灯", "action": "fly"}),
+                ("call_service", {"entity": "客厅灯", "service": "light.turn_on", "data": {"brightness_pct": 50}}),
+                ("call_service", {"entity": "switch.fan", "service": "turn_off"}),
+                ("call_service", {"entity": "switch.fan", "service": "turn_off"}),
+                ("call_service", {"entity": "switch.fan", "service": "silent"}),
+                ("call_service", {"entity": "不存在设备", "service": "turn_on"}),
             ]
             for name, args in cases:
                 r = await call(session, name, args)
@@ -61,8 +68,12 @@ async def main():
                 print("   msg=" + str(msg))
                 if name == "list_devices" and isinstance(d, dict):
                     print("   total=" + str(d.get("total")) + " count=" + str(d.get("count")) + " has_more=" + str(d.get("has_more")))
-                if name == "control_device" and isinstance(d, dict) and d.get("ok"):
-                    print("   changed=" + str(d.get("changed")) + " before=" + json.dumps(d.get("before"), ensure_ascii=False) + " after=" + json.dumps(d.get("after"), ensure_ascii=False))
+                if name == "list_services" and isinstance(d, dict) and d.get("ok"):
+                    print("   domains=" + str(d.get("domain_count")) + " services=" + str(d.get("service_count")))
+                if name in ("control_device", "call_service") and isinstance(d, dict) and d.get("ok"):
+                    print("   status=" + str(d.get("status")) + " changed=" + str(d.get("changed")) +
+                          " service=" + str(d.get("service")) + " expected=" + str(d.get("expected_state")))
+                    print("   before=" + json.dumps(d.get("before"), ensure_ascii=False) + " after=" + json.dumps(d.get("after"), ensure_ascii=False))
 
 
 if __name__ == "__main__":

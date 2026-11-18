@@ -117,6 +117,11 @@ class HAClient:
         data = await self._request("GET", "/api/states")
         return data if isinstance(data, list) else []
 
+    async def get_services(self) -> list:
+        """GET /api/services，返回服务目录（每个 domain 及其服务与参数字段）。"""
+        data = await self._request("GET", "/api/services")
+        return data if isinstance(data, list) else []
+
     async def get_state(self, entity_id: str) -> dict | None:
         try:
             return await self._request("GET", "/api/states/" + entity_id)

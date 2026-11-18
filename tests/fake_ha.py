@@ -51,13 +51,66 @@ STATES = {
 }
 
 
+SERVICES = [
+    {"domain": "light", "services": {
+        "turn_on": {"name": "打开", "description": "Turn on a light", "fields": {
+            "brightness_pct": {"required": False, "selector": {"number": {"min": 0, "max": 100}}, "example": 50},
+            "color_temp_kelvin": {"required": False, "selector": {"number": {}}},
+            "rgb_color": {"required": False, "selector": {"color_rgb": {}}},
+        }},
+        "turn_off": {"name": "关闭", "description": "Turn off a light", "fields": {}},
+        "toggle": {"name": "切换", "description": "Toggle a light", "fields": {}},
+    }},
+    {"domain": "switch", "services": {
+        "turn_on": {"name": "打开", "description": "Turn on a switch", "fields": {}},
+        "turn_off": {"name": "关闭", "description": "Turn off a switch", "fields": {}},
+        "toggle": {"name": "切换", "description": "Toggle a switch", "fields": {}},
+    }},
+    {"domain": "climate", "services": {
+        "turn_on": {"name": "打开", "description": "Turn on climate", "fields": {}},
+        "turn_off": {"name": "关闭", "description": "Turn off climate", "fields": {}},
+        "set_temperature": {"name": "设定温度", "description": "Set target temperature", "fields": {
+            "temperature": {"required": True, "selector": {"number": {"min": 5, "max": 35}}, "example": 26},
+        }},
+        "set_hvac_mode": {"name": "设定模式", "description": "Set HVAC mode", "fields": {
+            "hvac_mode": {"required": True, "selector": {"select": {"options": ["off", "heat", "cool", "auto"]}}},
+        }},
+    }},
+    {"domain": "media_player", "services": {
+        "volume_set": {"name": "设定音量", "description": "Set volume", "fields": {
+            "volume_level": {"required": True, "selector": {"number": {"min": 0, "max": 1}}, "example": 0.3},
+        }},
+        "volume_mute": {"name": "静音", "description": "Mute or unmute", "fields": {
+            "is_volume_muted": {"required": True, "selector": {"boolean": {}}},
+        }},
+        "media_play": {"name": "播放", "description": "Play media", "fields": {}},
+        "media_pause": {"name": "暂停", "description": "Pause media", "fields": {}},
+        "media_stop": {"name": "停止", "description": "Stop media", "fields": {}},
+    }},
+    {"domain": "cover", "services": {
+        "open_cover": {"name": "打开", "description": "Open the cover", "fields": {}},
+        "close_cover": {"name": "关闭", "description": "Close the cover", "fields": {}},
+        "stop_cover": {"name": "停止", "description": "Stop the cover", "fields": {}},
+    }},
+]
+
+
+def _state_sig(st):
+    return json.dumps({"state": st.get("state"), "attributes": st.get("attributes")},
+                      sort_keys=True, ensure_ascii=False)
+
+
 def apply_service(domain, service, body):
     eid = body.get("entity_id")
     if eid not in STATES:
         return []  # 复刻 HA：对不存在实体返回 200 空列表
+    if service in ("silent", "noop"):
+        # 模拟新版 HA 的 null 返回：调用被接受但不返回结果、也不产生变化
+        return None
     st = STATES[eid]
     a = st["attributes"]
-    if service in ("turn_on", "open_cover", "start", "media_play"):
+    before = _state_sig(st)
+    if service == "turn_on":
         if domain == "cover":
             st["state"] = "open"
         else:
@@ -68,8 +121,12 @@ def apply_service(domain, service, body):
             a["color_temp_kelvin"] = body["color_temp_kelvin"]
         if "rgb_color" in body:
             a["rgb_color"] = body["rgb_color"]
+    elif service == "open_cover":
+        st["state"] = "open"
     elif service in ("turn_off", "close_cover", "stop", "media_stop"):
         st["state"] = "closed" if domain == "cover" else "off"
+    elif service == "start":
+        st["state"] = "on"
     elif service == "toggle":
         st["state"] = "off" if st["state"] == "on" else "on"
     elif service == "volume_set":
@@ -78,8 +135,18 @@ def apply_service(domain, service, body):
         a["is_volume_muted"] = body.get("is_volume_muted")
     elif service == "set_temperature":
         a["temperature"] = body.get("temperature")
+    elif service == "set_hvac_mode":
+        mode = body.get("hvac_mode")
+        a["hvac_mode"] = mode
+        if mode:
+            st["state"] = mode
+    elif service == "media_play":
+        st["state"] = "playing"
     elif service == "media_pause":
         st["state"] = "paused"
+    after = _state_sig(st)
+    if after != before:
+        return [dict(st)]
     return []
 
 
@@ -104,6 +171,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in ("/api", "/api/"):
             self._send({"message": "API running."})
+        elif path == "/api/services":
+            self._send(SERVICES)
         elif path == "/api/states":
             self._send(list(STATES.values()))
         elif path.startswith("/api/states/"):
