@@ -1,0 +1,26 @@
+# 小智 MCP 服务（Home Assistant 桥）—— 独立构建运行
+# 用法：cp .env.example .env 并填写 HA_URL/HA_TOKEN，然后 docker compose up -d --build
+services:
+  ha-mcp:
+    build: .
+    image: ha-mcp:latest
+    container_name: ha-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MCP_PORT','8090')+'/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # 推荐：让本服务与 xiaozhi-server 处于同一 Docker 网络，
+    # 这样 xiaozhi 可用 http://ha-mcp:8090/mcp 直接访问（见 README「接入小智后端」）。
+    # 取消下面注释并把网络名改成 xiaozhi 实际使用的网络：
+    # networks:
+    #   - xiaozhi-net
+# networks:
+#   xiaozhi-net:
+#     external: true

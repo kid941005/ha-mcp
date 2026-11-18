@@ -1,0 +1,24 @@
+# 【片段，不是完整 compose 文件】
+# 把下面这段（2 空格缩进）粘贴进 deploy/docker-compose.yml 的 services: 下，
+# 与 xiaozhi-server 处于同一默认网络，xiaozhi 即可用 http://ha-mcp:8090/mcp 直连。
+# build.context 视 ha-mcp 目录相对 deploy/ 的位置调整。
+
+  # ========== 小智 MCP 服务（Home Assistant 桥）==========
+  ha-mcp:
+    build:
+      context: ../ha-mcp
+    image: ha-mcp:latest
+    container_name: ha-mcp
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - HA_URL=https://ha.hqgg.top:59826
+      - HA_TOKEN=在这里填HA长期访问令牌
+    expose:
+      - "8090"     # 仅同网络访问，无需映射到宿主机
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MCP_PORT','8090')+'/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

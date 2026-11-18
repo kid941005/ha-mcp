@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# 一键离线自测：启动 fake HA + 本服务 + 端到端客户端，结束后自动清理。
+# 用法：export TEST_TOKEN=任意本地测试口令 && bash tests/run_local_test.sh
+set -e
+cd "$(dirname "$0")/.."
+
+PY=${PY:-python}
+: "${TEST_TOKEN:?请先 export TEST_TOKEN=任意本地测试口令（模拟器与本服务共用）}"
+
+export HA_URL=http://127.0.0.1:8123
+export HA_TOKEN="$TEST_TOKEN"
+export FAKE_HA_TOKEN="$TEST_TOKEN"
+export MCP_PORT=8090
+export MCP_TRANSPORT=streamable-http
+
+"$PY" tests/fake_ha.py & FAKE=$!
+sleep 1.5
+"$PY" server.py & SRV=$!
+sleep 4
+
+echo "===== e2e ====="
+RC=0
+"$PY" tests/e2e_mcp_client.py || RC=$?
+echo "===== health ====="
+if command -v curl >/dev/null 2>&1; then curl -s "http://127.0.0.1:8090/health"; echo; fi
+
+kill "$SRV" "$FAKE" 2>/dev/null || true
+exit ${RC}

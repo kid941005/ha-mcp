@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ha": {
+      "url": "http://ha-mcp:8090/mcp",
+      "transport": "streamable-http",
+      "timeout": 30,
+      "sse_read_timeout": 300
+    }
+  }
+}
