@@ -17,8 +17,10 @@
   HA_WS_ENABLED  是否用 WebSocket 读取设备/实体注册表以支持“按设备聚合”，默认 true
   HA_WS_URL      HA WebSocket 地址，默认由 HA_URL 推导为 ws(s)://host/api/websocket
   HA_REGISTRY_TTL 设备注册表缓存秒数，默认 60
-  SERVICE_CONFIRM_DELAY   服务调用后回读前的等待秒数，默认 0.6
-  SERVICE_CONFIRM_RETRIES 服务调用后回读的重试次数，默认 1
+  SERVICE_CONFIRM_DELAY   服务调用后首次回读前的等待秒数，默认 0.6
+  SERVICE_CONFIRM_RETRIES 服务调用后最少额外回读次数，默认 1
+  SERVICE_CONFIRM_INTERVAL 回读轮询间隔秒数，默认同 SERVICE_CONFIRM_DELAY
+  SERVICE_CONFIRM_TIMEOUT 回读确认总超时秒数，默认 4.0（窗口内持续轮询直到匹配预期）
   LOG_LEVEL     日志级别，默认 INFO
   DEFAULT_LIST_LIMIT / MAX_LIST_LIMIT  list_devices 默认/最大返回条数
 """
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -36,6 +39,9 @@ DEFAULT_LIST_LIMIT = int(os.environ.get("DEFAULT_LIST_LIMIT", "50"))
 MAX_LIST_LIMIT = int(os.environ.get("MAX_LIST_LIMIT", "500"))
 SERVICE_CONFIRM_DELAY = float(os.environ.get("SERVICE_CONFIRM_DELAY", "0.6"))
 SERVICE_CONFIRM_RETRIES = int(os.environ.get("SERVICE_CONFIRM_RETRIES", "1"))
+# 回读轮询间隔与总超时：在窗口内反复读取，直到状态/属性与预期一致
+SERVICE_CONFIRM_INTERVAL = float(os.environ.get("SERVICE_CONFIRM_INTERVAL", str(SERVICE_CONFIRM_DELAY)))
+SERVICE_CONFIRM_TIMEOUT = float(os.environ.get("SERVICE_CONFIRM_TIMEOUT", "4.0"))
 
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "play",
@@ -76,7 +82,8 @@ mcp = FastMCP(
         "group_by=\"device\" 按物理设备聚合多个实体）；"
         "查看单个设备状态用 get_device_state（entity 可传 entity_id 或中文名称）；"
         "查询某类设备支持哪些服务与参数用 list_services；"
-        "常规控制用 control_device（action 见工具描述，value 用于亮度/音量/温度等）；"
+        "常规控制用 control_device（action 见工具描述，value 用于亮度/音量/温度等，"
+        "控制后自动回读校验状态与属性）；"
         "需要执行上述未覆盖的任意 HA 服务时用 call_service（服务名 + 参数 JSON）；"
         "不确定设备类型时先用 list_domains 查看有哪些类别。"
     ),
@@ -257,38 +264,145 @@ def _field_brief(fname: str, fdef: dict) -> dict:
     return out
 
 
+def _num(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _value_matches(actual: Any, expected: Any, tolerance: float = 0.0) -> bool:
+    """比较回读值与预期值，数字按容差、列表逐项、布尔按真值。"""
+    if isinstance(expected, (list, tuple)):
+        if not isinstance(actual, (list, tuple)) or len(actual) != len(expected):
+            return False
+        return all(_value_matches(a, e, tolerance) for a, e in zip(actual, expected))
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return actual is not None and bool(actual) == bool(expected)
+    na, ne = _num(actual), _num(expected)
+    if na is not None and ne is not None:
+        return abs(na - ne) <= float(tolerance or 0)
+    return actual == expected
+
+
+def _expected_attributes(payload: dict) -> dict:
+    """从服务调用参数推断需要回读核对的属性预期（含合理容差）。"""
+    exp: dict = {}
+    if not isinstance(payload, dict):
+        return exp
+    pct = _num(payload.get("brightness_pct"))
+    if pct is not None:
+        exp["brightness"] = {"expected": int(round(pct * 2.55)), "tolerance": 3}
+    bright = _num(payload.get("brightness"))
+    if bright is not None:
+        exp["brightness"] = {"expected": int(round(bright)), "tolerance": 1}
+    kelvin = _num(payload.get("color_temp_kelvin"))
+    if kelvin is not None:
+        exp["color_temp_kelvin"] = {"expected": int(round(kelvin)), "tolerance": 10}
+    if isinstance(payload.get("rgb_color"), (list, tuple)):
+        exp["rgb_color"] = {"expected": [int(x) for x in payload["rgb_color"]], "tolerance": 0}
+    vol = _num(payload.get("volume_level"))
+    if vol is not None:
+        exp["volume_level"] = {"expected": vol, "tolerance": 0.02}
+    temp = _num(payload.get("temperature"))
+    if temp is not None:
+        exp["temperature"] = {"expected": temp, "tolerance": 0.5}
+    if "is_volume_muted" in payload:
+        exp["is_volume_muted"] = {"expected": bool(payload.get("is_volume_muted")), "tolerance": 0}
+    if "hvac_mode" in payload:
+        exp["hvac_mode"] = {"expected": payload.get("hvac_mode"), "tolerance": 0}
+    return exp
+
+
+def _check_after(after: Optional[dict], expected_state: Optional[str],
+                 attr_expect: dict) -> dict:
+    """对一次回读做状态 + 属性逐项校验，返回 checks / mismatches。"""
+    checks: list = []
+    mismatches: list = []
+    if expected_state is not None:
+        actual = after.get("state") if after else None
+        ok = actual == expected_state
+        item = {"kind": "state", "field": "state", "expected": expected_state,
+                "actual": actual, "ok": ok}
+        checks.append(item)
+        if not ok:
+            mismatches.append(item)
+    for field, spec in attr_expect.items():
+        actual = after.get(field) if after else None
+        expected = spec.get("expected")
+        ok = _value_matches(actual, expected, spec.get("tolerance", 0))
+        item = {"kind": "attribute", "field": field, "expected": expected,
+                "actual": actual, "ok": ok}
+        checks.append(item)
+        if not ok:
+            mismatches.append(item)
+    return {"verified": not mismatches, "checks": checks, "mismatches": mismatches}
+
+
 async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
                              service: str, payload: dict, action_label: str) -> dict:
-    """执行一次 HA 服务调用，并用「三态返回 + 乐观推断 + 延迟回读」确认效果。
+    """执行 HA 服务调用，并在超时窗口内轮询回读，校验「状态 + 属性」是否达到预期。
+
+    不再只判断「有没有变化」，而是按服务语义推导预期：
+      - 状态预期：turn_on→on、turn_off→off、open_cover→open、set_hvac_mode→指定模式等；
+      - 属性预期：brightness_pct→brightness、temperature、volume_level、color_temp_kelvin、rgb_color 等。
+    回读在 SERVICE_CONFIRM_TIMEOUT 秒内按 SERVICE_CONFIRM_INTERVAL 轮询，直到全部匹配或超时。
 
     status 语义：
-      confirmed        已确认状态发生变化（回读到 after != before）
-      no_change        HA 返回空数组，调用被接受但无状态变化（如已是目标状态/设备不支持）
-      accepted_pending HA 返回 null（新版 HA），已下发但尚未观察到变化，附乐观预期状态
+      confirmed        回读确认状态/属性已达到预期（且确有变化）
+      no_change        HA 已接受但无变化；若校验通过表示「本来就是目标状态」
+      mismatch         回读观察到变化，但状态或属性与预期不符（设备能力/参数问题）
+      accepted_pending HA 返回 null（新版 HA 常见），回读窗口内仍未完全匹配预期
     """
     eid = str(st.get("entity_id"))
     before = snapshot(st)
+    before_state = st.get("state") if st else None
+    expected = _expected_state(service, before_state)
+    # set_hvac_mode 等服务的预期状态来自参数
+    if isinstance(payload, dict) and payload.get("hvac_mode"):
+        expected = str(payload["hvac_mode"])
+    attr_expect = _expected_attributes(payload)
+    has_expectation = expected is not None or bool(attr_expect)
+
+    started = time.monotonic()
     resp = await ha.call_service(service_domain, service, payload)
     resp_kind = _classify_service_response(resp)
-    expected = _expected_state(service, (st.get("state") if st else None))
 
+    min_attempts = max(1, int(SERVICE_CONFIRM_RETRIES) + 1)
+    interval = SERVICE_CONFIRM_INTERVAL if SERVICE_CONFIRM_INTERVAL > 0 else 0.0
+    attempts = 0
     after = None
     changed = False
-    attempts = max(0, int(SERVICE_CONFIRM_RETRIES)) + 1
-    for _i in range(attempts):
-        if SERVICE_CONFIRM_DELAY > 0:
-            await asyncio.sleep(SERVICE_CONFIRM_DELAY)
+    check = {"verified": False, "checks": [], "mismatches": []}
+
+    while True:
+        if attempts == 0:
+            if SERVICE_CONFIRM_DELAY > 0:
+                await asyncio.sleep(SERVICE_CONFIRM_DELAY)
+        elif interval > 0:
+            await asyncio.sleep(interval)
+        attempts += 1
         try:
             after_st = await ha.get_state(eid)
         except HAError:
             after_st = None
         after = snapshot(after_st)
         changed = after is not None and after != before
-        if changed:
+        check = _check_after(after, expected, attr_expect)
+        if has_expectation:
+            if check["verified"]:
+                break
+        elif changed:
+            break
+        if attempts >= min_attempts and (time.monotonic() - started) >= SERVICE_CONFIRM_TIMEOUT:
             break
 
-    if changed:
-        status = "confirmed"
+    verified = bool(check["verified"]) if has_expectation else bool(changed)
+    if has_expectation and check["verified"]:
+        status = "confirmed" if changed else "no_change"
+    elif changed:
+        # 无明确预期时只能确认「有变化」，不能判为 mismatch
+        status = "mismatch" if has_expectation else "confirmed"
     elif resp_kind in ("empty", "states"):
         status = "no_change"
     else:  # none
@@ -300,20 +414,41 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
     if after is not None:
         msg += "，当前状态：" + str(after.get("state"))
     if status == "confirmed":
-        msg += "。"
+        if has_expectation:
+            msg += "。已回读确认达到预期（" + str(attempts) + " 次）"
+        else:
+            msg += "。已回读确认状态发生变化（" + str(attempts) + " 次；该服务无明确预期，按变化确认）"
+    elif status == "mismatch":
+        detail = "；".join(
+            str(m.get("field")) + " 期望 " + str(m.get("expected")) + "，实际 " + str(m.get("actual"))
+            for m in check["mismatches"]
+        )
+        msg += "。已观察到变化，但与预期不符：" + detail + "（回读 " + str(attempts) + " 次）。请检查设备能力或参数。"
     elif status == "no_change":
-        msg += "。注意：HA 已接受调用，但未观察到状态变化——设备可能不支持该操作或当前已是目标状态。"
+        if verified:
+            msg += "。回读确认设备已处于目标状态（" + str(attempts) + " 次）"
+        else:
+            msg += "。注意：HA 已接受调用，但回读未见状态变化——设备可能不支持该操作或当前已是目标状态。"
     else:  # accepted_pending
-        msg += "。HA 未返回调用结果（新版 HA 常见），已下发但暂未观察到变化"
+        msg += "。HA 未返回调用结果（新版 HA 常见），已下发但回读 " + str(attempts) + " 次仍未完全匹配预期"
         if expected:
-            msg += "，预期变为：" + expected
+            msg += "（预期状态：" + expected + "）"
         msg += "；若稍后仍未变化，可用 get_device_state 复查。"
 
+    verification = {
+        "verified": verified,
+        "attempts": attempts,
+        "elapsed_ms": int(round((time.monotonic() - started) * 1000)),
+        "expectations": {"state": expected, "attributes": attr_expect},
+        "checks": check["checks"],
+        "mismatches": check["mismatches"],
+    }
     return {
         "entity_id": eid, "name": name, "service": svc_str,
         "response_kind": resp_kind, "status": status,
         "expected_state": expected, "before": before, "after": after,
-        "changed": changed, "message": msg,
+        "changed": changed, "verified": verified,
+        "verification": verification, "message": msg,
     }
 
 
@@ -568,7 +703,9 @@ async def control_device(entity: str, action: str, value: Optional[float] = None
         set_color          value=颜色 #RRGGBB 或 "r,g,b"（light）
       value   数字参数，按 action 需要提供。
 
-    控制后会回读设备状态确认；若 HA 接受调用但状态未变化会给出提示（避免静默假成功）。
+    控制后会在超时窗口内轮询回读，校验状态 + 亮度/温度/音量/颜色等属性是否达到预期，
+    返回 verified 与 verification（attempts/checks/mismatches/elapsed_ms）。
+    若 HA 接受调用但未达预期会明确返回 mismatch 或 no_change，避免静默假成功。
     适用场景：「把客厅灯亮度调到 50」「关掉风扇」「空调设到 26 度」「电视音量 30」。
     """
     try:
@@ -710,10 +847,11 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None) -
       data    额外参数（JSON 对象），如 {"brightness":128}、{"temperature":26}、
               {"hvac_mode":"heat"}、{"rgb_color":[255,0,0]}；无需参数时省略。
 
-    返回三态结果：
-      status=confirmed        已确认状态发生变化
-      status=no_change        HA 返回空数组，调用被接受但无状态变化
-      status=accepted_pending HA 返回 null（新版 HA），已下发但未观察到变化，附乐观预期状态
+    返回状态回读校验结果（verified / verification）：
+      status=confirmed        回读确认状态/属性已达到预期
+      status=no_change        HA 已接受但无变化（verified=true 表示本来就是目标状态）
+      status=mismatch         回读有变化，但状态/属性与预期不符
+      status=accepted_pending HA 返回 null（新版 HA），回读窗口内仍未完全匹配预期
     适用场景：「把空调设成制热模式」「灯切成暖光」「设置风扇风速」「执行自定义脚本」。
     """
     try:

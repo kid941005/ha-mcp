@@ -58,6 +58,9 @@ STATES = {
     },
 }
 
+# 延迟生效队列：模拟设备状态在服务调用后若干次轮询才真正变化
+PENDING = {}
+
 
 SERVICES = [
     {"domain": "light", "services": {
@@ -137,6 +140,17 @@ def _state_sig(st):
                       sort_keys=True, ensure_ascii=False)
 
 
+def _apply_pending(eid):
+    """每次状态读取时推进延迟生效队列（模拟真实设备的异步状态更新）。"""
+    p = PENDING.get(eid)
+    if not p:
+        return
+    p["remaining"] -= 1
+    if p["remaining"] <= 0:
+        STATES[eid]["state"] = p["state"]
+        PENDING.pop(eid, None)
+
+
 def apply_service(domain, service, body):
     eid = body.get("entity_id")
     if eid not in STATES:
@@ -147,6 +161,22 @@ def apply_service(domain, service, body):
     st = STATES[eid]
     a = st["attributes"]
     before = _state_sig(st)
+    # 延迟服务：先返回 null，状态在后续第 3 次读取时才生效（2 次读取仍为旧值）
+    if service.endswith("_delayed"):
+        base = service[:-len("_delayed")]
+        if base == "open_cover":
+            target = "open"
+        elif base in ("turn_off", "close_cover", "media_stop"):
+            target = "off"
+        else:
+            target = "on"
+        PENDING[eid] = {"state": target, "remaining": 2}
+        return None
+    # 故意忽略参数的异常场景：用于验证属性回读校验能识别“状态变了但参数没生效”
+    if service == "turn_on_ignore_brightness":
+        st["state"] = "on"
+        after = _state_sig(st)
+        return [dict(st)] if after != before else []
     if service == "turn_on":
         if domain == "cover":
             st["state"] = "open"
@@ -249,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/states/"):
             eid = path[len("/api/states/"):]
             if eid in STATES:
+                _apply_pending(eid)
                 self._send(STATES[eid])
             else:
                 self._send({"message": "Entity not found."}, 404)

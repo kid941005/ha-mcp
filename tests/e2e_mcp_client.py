@@ -61,6 +61,10 @@ async def main():
                 ("call_service", {"entity": "switch.fan", "service": "turn_off"}),
                 ("call_service", {"entity": "switch.fan", "service": "silent"}),
                 ("call_service", {"entity": "不存在设备", "service": "turn_on"}),
+                # P2 状态回读校验：延迟生效（需轮询多次才确认）与属性不生效（应识别为 mismatch）
+                ("call_service", {"entity": "客厅灯", "service": "light.turn_off_delayed"}),
+                ("call_service", {"entity": "客厅灯", "service": "light.turn_on_ignore_brightness",
+                                  "data": {"brightness_pct": 80}}),
             ]
             for name, args in cases:
                 r = await call(session, name, args)
@@ -87,6 +91,11 @@ async def main():
                 if name in ("control_device", "call_service") and isinstance(d, dict) and d.get("ok"):
                     print("   status=" + str(d.get("status")) + " changed=" + str(d.get("changed")) +
                           " service=" + str(d.get("service")) + " expected=" + str(d.get("expected_state")))
+                    v = d.get("verification") or {}
+                    print("   verified=" + str(d.get("verified")) + " attempts=" + str(v.get("attempts")) +
+                          " elapsed_ms=" + str(v.get("elapsed_ms")))
+                    if v.get("mismatches"):
+                        print("   mismatches=" + json.dumps(v["mismatches"], ensure_ascii=False))
                     print("   before=" + json.dumps(d.get("before"), ensure_ascii=False) + " after=" + json.dumps(d.get("after"), ensure_ascii=False))
 
 

@@ -4,7 +4,7 @@
 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言调用，支持 Docker 一键部署。
 
 > 核心特性：配置只走环境变量（不硬编码）、只读/控制一体化、服务能力自描述（`list_services`）、
-> 通用服务调用（`call_service`，覆盖任意 HA 服务）、控制后三态回读复核（confirmed/no_change/accepted_pending）、
+> 通用服务调用（`call_service`，覆盖任意 HA 服务）、控制后状态+属性四态回读校验（confirmed/no_change/mismatch/accepted_pending）、
 > 每个实体带 `controllable` 可控标记与 `actions` 动作清单、`group_by="device"` 按物理设备聚合、
 > 错误全部转为中文可读提示且服务不崩溃、设备列表支持过滤与分页。
 
@@ -72,6 +72,8 @@ ha-mcp/
 | `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数（防止一次返回过多） |
 | `SERVICE_CONFIRM_DELAY` | | `0.6` | 服务调用后回读前的等待秒数（等待设备状态刷新） |
 | `SERVICE_CONFIRM_RETRIES` | | `1` | 服务调用后回读的额外重试次数 |
+| `SERVICE_CONFIRM_INTERVAL` | | 同 `SERVICE_CONFIRM_DELAY` | 回读轮询间隔秒数 |
+| `SERVICE_CONFIRM_TIMEOUT` | | `4.0` | 回读确认总超时秒数（窗口内持续轮询直到匹配预期） |
 
 > 安全：`HA_TOKEN` 只通过环境变量注入，不写入镜像、不写入代码、不写进 Git。
 
@@ -173,8 +175,13 @@ python server.py
 | `set_color_temp` | 设置色温（light） | 开尔文 |
 | `set_color` | 设置颜色（light） | `#RRGGBB` 或 `"r,g,b"` |
 
-返回：`{ok,entity_id,name,action,service,response_kind,status,expected_state,before,after,changed,message}`
-**控制后三态回读复核**：`status` 为 `confirmed`（确认已变化）/ `no_change`（HA 返回空数组，调用被接受但无变化）/ `accepted_pending`（HA 返回 null，新版 HA 常见，已下发但未观察到变化，附 `expected_state` 乐观预期）。据此避免 HA「对不存在实体也返回 200」造成的静默假成功。
+返回：`{ok,entity_id,name,action,service,response_kind,status,expected_state,before,after,changed,verified,verification,message}`
+**控制后状态+属性回读校验**：服务调用后会在 `SERVICE_CONFIRM_TIMEOUT` 秒内轮询回读，既核对状态（如 turn_on→on），也核对属性（亮度、温度、音量、色温、颜色等），`status` 为：
+- `confirmed`：回读确认状态/属性已达到预期（且确有变化）；
+- `no_change`：HA 已接受但无变化；若 `verified=true` 表示设备本来就是目标状态；
+- `mismatch`：回读看到变化，但状态或属性与预期不符（设备能力/参数问题）；
+- `accepted_pending`：HA 返回 null（新版 HA 常见），已下发但回读窗口内仍未完全匹配。
+`verification` 给出 `attempts`（回读次数）、`elapsed_ms`、`expectations`、`checks`、`mismatches`，便于调用方判断是否真正生效，避免 HA「对不存在实体也返回 200」造成的静默假成功。
 > 若设备类型本身不可控制（如 `sensor`），返回 `code:"not_controllable"` 并说明原因，不会误发服务。
 
 ### 5.4 `list_services` — 查询设备能力（服务目录）
@@ -201,8 +208,8 @@ python server.py
 | `service` | string | 是 | 服务名：`turn_on`（默认用设备 domain）或 `climate.set_hvac_mode`（显式带 domain 以它为准） |
 | `data` | object | 否 | 额外参数 JSON，如 `{"temperature":26}`、`{"hvac_mode":"heat"}`、`{"rgb_color":[255,0,0]}` |
 
-返回：`{ok,entity_id,name,service,response_kind,status,expected_state,before,after,changed,message}`
-`status` 三态同 `control_device`：`confirmed` / `no_change` / `accepted_pending`。
+返回：`{ok,entity_id,name,service,response_kind,status,expected_state,before,after,changed,verified,verification,message}`
+`status` 四态同 `control_device`：`confirmed` / `no_change` / `mismatch` / `accepted_pending`；`verification` 含 `attempts`、`elapsed_ms`、`checks`、`mismatches`。
 
 ### 5.6 `list_domains` — 获取设备类型
 
@@ -282,7 +289,8 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | 打开窗帘 | `control_device` | `{"entity":"窗帘","action":"open"}` | `{"ok":true,"service":"cover.open_cover","changed":true,"after":{"state":"open"}}` |
 | 空调能做什么操作？ | `list_services` | `{"entity":"空调"}` | `{"ok":true,"domain":"climate","service_count":4,"services":[{"service":"set_temperature","fields":[{"name":"temperature","required":true}]},...]}` |
 | 空调设成制热模式 | `call_service` | `{"entity":"空调","service":"climate.set_hvac_mode","data":{"hvac_mode":"heat"}}` | `{"ok":true,"status":"confirmed","after":{"state":"heat"}}` |
-| 把客厅灯切成暖光 | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"color_temp_kelvin":2700}}` | `{"ok":true,"status":"confirmed"}` |
+| 把客厅灯切成暖光 | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"color_temp_kelvin":2700}}` | `{"ok":true,"status":"confirmed","verified":true,"verification":{"attempts":1,...}}` |
+| 把客厅灯亮度调到 80（设备没调到） | `call_service` | `{"entity":"客厅灯","service":"light.turn_on","data":{"brightness_pct":80}}` | `{"ok":true,"status":"mismatch","verified":false,"verification":{"mismatches":[{"field":"brightness","expected":204,"actual":127}]}}` |
 
 失败示例（清晰提示，不崩溃）：
 
@@ -336,9 +344,11 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 7. **按设备聚合不可用**：`list_devices(group_by="device")` 依赖 HA WebSocket `config/device_registry/list`。
    若返回 `registry_available:false`（令牌无权限、WS 被代理/防火墙拦截），会自动降级为按实体展示；
    可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
+8. **控制回读不符（status=mismatch）**：说明 HA 接受了调用、状态也变了，但属性未达目标（如设备不支持该亮度/温度范围）。
+   核对 `list_services` 的字段与设备能力，必要时用 `get_device_state` 复查。
 
 > 已知 HA 行为：对**不存在的实体**调用 service 也会返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
-> 本服务在 `control_device` / `call_service` 后执行**三态回读复核**：`response_kind`(states/empty/none) + `status`(confirmed/no_change/accepted_pending) + `changed`，避免误报成功。
+> 本服务在 `control_device` / `call_service` 后执行**状态+属性回读校验**：`response_kind`(states/empty/none)、`status`(confirmed/no_change/mismatch/accepted_pending)、`verified` 与 `verification`(checks/mismatches)，避免误报成功。
 
 ---
 
@@ -370,7 +380,7 @@ python server.py
 python tests/e2e_mcp_client.py
 ```
 
-`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，用于验证回读复核逻辑；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。
+`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，并内置「延迟生效（*_delayed）」「只改状态不改属性（turn_on_ignore_brightness）」两种场景，用于验证回读确认与 mismatch 识别；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。
 
 ---
 
