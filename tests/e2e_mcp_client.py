@@ -40,6 +40,9 @@ async def main():
                 ("list_devices", {}),
                 ("list_devices", {"domain": "light"}),
                 ("list_devices", {"keyword": "客厅"}),
+                ("list_devices", {"controllable_only": True}),
+                ("list_devices", {"group_by": "device"}),
+                ("list_devices", {"keyword": "客厅", "group_by": "device"}),
                 ("list_domains", {}),
                 ("list_services", {}),
                 ("list_services", {"domain": "light"}),
@@ -50,6 +53,7 @@ async def main():
                 ("control_device", {"entity": "空调", "action": "set_temperature", "value": 26}),
                 ("control_device", {"entity": "窗帘", "action": "turn_on"}),
                 ("control_device", {"entity": "电视", "action": "set_volume", "value": 30}),
+                ("control_device", {"entity": "sensor.living_temp", "action": "turn_on"}),
                 ("control_device", {"entity": "不存在设备", "action": "turn_on"}),
                 ("control_device", {"entity": "客厅灯", "action": "fly"}),
                 ("call_service", {"entity": "客厅灯", "service": "light.turn_on", "data": {"brightness_pct": 50}}),
@@ -67,7 +71,17 @@ async def main():
                 print("   ok=" + str(ok) + " isError=" + str(r["isError"]))
                 print("   msg=" + str(msg))
                 if name == "list_devices" and isinstance(d, dict):
-                    print("   total=" + str(d.get("total")) + " count=" + str(d.get("count")) + " has_more=" + str(d.get("has_more")))
+                    print("   total=" + str(d.get("total")) + " count=" + str(d.get("count")) +
+                          " has_more=" + str(d.get("has_more")) + " grouped_by=" + str(d.get("grouped_by")) +
+                          " registry=" + str(d.get("registry_available")))
+                    if d.get("devices"):
+                        first = d["devices"][0]
+                        if d.get("grouped_by") == "device":
+                            print("   first_device=" + str(first.get("name")) + " entity_count=" +
+                                  str(first.get("entity_count")) + " controllable=" + str(first.get("controllable")))
+                        else:
+                            print("   first_entity=" + str(first.get("entity_id")) + " controllable=" +
+                                  str(first.get("controllable")) + " actions=" + str(first.get("actions")))
                 if name == "list_services" and isinstance(d, dict) and d.get("ok"):
                     print("   domains=" + str(d.get("domain_count")) + " services=" + str(d.get("service_count")))
                 if name in ("control_device", "call_service") and isinstance(d, dict) and d.get("ok"):

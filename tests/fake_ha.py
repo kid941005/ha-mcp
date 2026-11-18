@@ -8,12 +8,20 @@
 运行：TEST_TOKEN=yourpass python tests/fake_ha.py
 （默认监听 127.0.0.1:8123；令牌通过 FAKE_HA_TOKEN 指定，缺省 devtoken）
 """
+import asyncio
 import json
 import os
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import websockets
+except Exception:  # noqa: BLE001
+    websockets = None
 
 TOKEN = os.environ.get("FAKE_HA_TOKEN", "devtoken")
 PORT = int(os.environ.get("FAKE_HA_PORT", "8123"))
+WS_PORT = int(os.environ.get("FAKE_HA_WS_PORT", "8124"))
 BIND = os.environ.get("FAKE_HA_BIND", "127.0.0.1")
 
 STATES = {
@@ -95,6 +103,35 @@ SERVICES = [
 ]
 
 
+# 设备注册表 / 实体注册表（复刻 HA WebSocket API config/*_registry/list 的返回结构）
+DEVICE_REGISTRY = [
+    {"id": "dev_living", "name": "客厅环境组", "name_by_user": None, "manufacturer": "DemoTech",
+     "model": "Living Kit", "model_id": "LK-1", "area_id": "living_room", "disabled_by": None},
+    {"id": "dev_climate", "name": "客厅空调", "name_by_user": None, "manufacturer": "CoolCo",
+     "model": "AC-1", "model_id": "AC-1", "area_id": "living_room", "disabled_by": None},
+    {"id": "dev_fan", "name": "电风扇", "name_by_user": None, "manufacturer": "WindCo",
+     "model": "F1", "model_id": "F1", "area_id": "living_room", "disabled_by": None},
+    {"id": "dev_tv", "name": "电视", "name_by_user": None, "manufacturer": "Vision",
+     "model": "TV-4K", "model_id": "TV4K", "area_id": "living_room", "disabled_by": None},
+    {"id": "dev_curtain", "name": "窗帘", "name_by_user": None, "manufacturer": "HomeAuto",
+     "model": "C1", "model_id": "C1", "area_id": "living_room", "disabled_by": None},
+]
+ENTITY_REGISTRY = [
+    {"entity_id": "light.living_room", "device_id": "dev_living", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "sensor.living_temp", "device_id": "dev_living", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "climate.ac", "device_id": "dev_climate", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "switch.fan", "device_id": "dev_fan", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "media_player.tv", "device_id": "dev_tv", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+    {"entity_id": "cover.curtain", "device_id": "dev_curtain", "area_id": None,
+     "disabled_by": None, "hidden_by": None},
+]
+
+
 def _state_sig(st):
     return json.dumps({"state": st.get("state"), "attributes": st.get("attributes")},
                       sort_keys=True, ensure_ascii=False)
@@ -148,6 +185,40 @@ def apply_service(domain, service, body):
     if after != before:
         return [dict(st)]
     return []
+
+
+async def _ws_handler(ws):
+    """极简 HA WebSocket：auth 握手 + device/entity 注册表查询。"""
+    await ws.send(json.dumps({"type": "auth_required", "ha_version": "2026.1.0"}))
+    try:
+        raw = await ws.recv()
+    except Exception:  # noqa: BLE001
+        return
+    req = json.loads(raw)
+    if req.get("type") != "auth" or req.get("access_token") != TOKEN:
+        await ws.send(json.dumps({"type": "auth_invalid", "message": "Invalid access token"}))
+        return
+    await ws.send(json.dumps({"type": "auth_ok", "ha_version": "2026.1.0"}))
+    async for raw in ws:
+        req = json.loads(raw)
+        rid = req.get("id")
+        typ = req.get("type")
+        if typ == "config/device_registry/list":
+            result = DEVICE_REGISTRY
+        elif typ == "config/entity_registry/list":
+            result = ENTITY_REGISTRY
+        else:
+            await ws.send(json.dumps({"id": rid, "type": "result", "success": False,
+                                      "error": {"code": "unknown_command", "message": "Unknown command."}}))
+            continue
+        await ws.send(json.dumps({"id": rid, "type": "result", "success": True, "result": result}))
+
+
+def _run_ws():
+    async def runner():
+        async with websockets.serve(_ws_handler, BIND, WS_PORT):
+            await asyncio.Future()
+    asyncio.run(runner())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -204,4 +275,9 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print("fake HA on " + BIND + ":" + str(PORT) + " (token from FAKE_HA_TOKEN)", flush=True)
+    if websockets is not None:
+        threading.Thread(target=_run_ws, daemon=True).start()
+        print("fake HA ws on ws://" + BIND + ":" + str(WS_PORT) + "/api/websocket", flush=True)
+    else:
+        print("[fake-ha] websockets 未安装，跳过注册表 WS；设备聚合将降级为按实体展示", flush=True)
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

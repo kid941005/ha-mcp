@@ -14,6 +14,9 @@
   MCP_SSE_PATH  sse 路径，默认 /sse
   HA_TIMEOUT    HA 请求超时秒数，默认 10
   HA_VERIFY_SSL 是否校验 HA 的 TLS 证书，默认 true
+  HA_WS_ENABLED  是否用 WebSocket 读取设备/实体注册表以支持“按设备聚合”，默认 true
+  HA_WS_URL      HA WebSocket 地址，默认由 HA_URL 推导为 ws(s)://host/api/websocket
+  HA_REGISTRY_TTL 设备注册表缓存秒数，默认 60
   SERVICE_CONFIRM_DELAY   服务调用后回读前的等待秒数，默认 0.6
   SERVICE_CONFIRM_RETRIES 服务调用后回读的重试次数，默认 1
   LOG_LEVEL     日志级别，默认 INFO
@@ -37,8 +40,26 @@ SERVICE_CONFIRM_RETRIES = int(os.environ.get("SERVICE_CONFIRM_RETRIES", "1"))
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "play",
     "set_brightness", "set_volume", "volume_mute", "volume_unmute",
-    "set_temperature", "set_color_temp", "set_color",
+    "set_temperature", "set_color_temp", "set_color", "lock", "unlock",
 ]
+
+# 各设备类型内置支持的控制动作（与 build_service 对齐）。不在表内的类型视为“无内置控制”，
+# 仍可用 list_services + call_service 直接调用任意 HA 服务。
+DOMAIN_ACTIONS = {
+    "light": ["turn_on", "turn_off", "toggle", "set_brightness", "set_color_temp", "set_color"],
+    "switch": ["turn_on", "turn_off", "toggle"],
+    "fan": ["turn_on", "turn_off", "toggle"],
+    "input_boolean": ["turn_on", "turn_off", "toggle"],
+    "automation": ["turn_on", "turn_off", "toggle"],
+    "cover": ["open", "close", "stop", "turn_on", "turn_off"],
+    "climate": ["turn_on", "turn_off", "set_temperature"],
+    "media_player": ["turn_on", "turn_off", "play", "pause", "stop", "continue",
+                     "set_volume", "volume_mute", "volume_unmute"],
+    "vacuum": ["turn_on", "turn_off", "stop", "pause", "continue"],
+    "lock": ["lock", "unlock"],
+    "scene": ["turn_on"],
+    "script": ["turn_on"],
+}
 
 # 用于判断控制前后状态是否真的变化（排除 last_changed 之类的时间戳噪声）
 SNAP_KEYS = [
@@ -50,7 +71,9 @@ mcp = FastMCP(
     "ha-mcp",
     instructions=(
         "把 Home Assistant 的智能家居设备封装为 MCP 工具。"
-        "查看设备用 list_devices（可按 keyword 名称关键字或 domain 设备类型过滤，支持分页）；"
+        "查看设备用 list_devices（可按 keyword 名称关键字或 domain 设备类型过滤，支持分页；"
+        "结果带 controllable 标记说明是否可控制；controllable_only=true 只看可控设备；"
+        "group_by=\"device\" 按物理设备聚合多个实体）；"
         "查看单个设备状态用 get_device_state（entity 可传 entity_id 或中文名称）；"
         "查询某类设备支持哪些服务与参数用 list_services；"
         "常规控制用 control_device（action 见工具描述，value 用于亮度/音量/温度等）；"
@@ -94,6 +117,82 @@ def summarize(st: dict) -> dict:
         "unit": a.get("unit_of_measurement"),
         "device_class": a.get("device_class"),
     }
+
+
+def _controllability(entity_id: str, state: Any) -> dict:
+    """判断一个实体是否可控制，并给出内置动作列表。"""
+    domain = _domain_of(entity_id)
+    actions = list(DOMAIN_ACTIONS.get(domain, []))
+    if not actions:
+        return {"controllable": False, "actions": [],
+                "controllable_reason": "该类型无内置控制动作，可先用 list_services 查能力，再用 call_service 调用"}
+    if str(state) in ("unavailable", "unknown"):
+        return {"controllable": False, "actions": actions,
+                "controllable_reason": "设备当前状态不可用（" + str(state) + "）"}
+    return {"controllable": True, "actions": actions, "controllable_reason": "可控制"}
+
+
+def _registry_maps(reg: Optional[dict]) -> tuple:
+    devices: dict = {}
+    ents: dict = {}
+    if not reg:
+        return devices, ents
+    for d in reg.get("devices") or []:
+        if isinstance(d, dict) and d.get("id"):
+            devices[d["id"]] = d
+    for e in reg.get("entities") or []:
+        if isinstance(e, dict) and e.get("entity_id"):
+            ents[e["entity_id"]] = e
+    return devices, ents
+
+
+def _device_label(d: Optional[dict]) -> Optional[str]:
+    if not d:
+        return None
+    return d.get("name_by_user") or d.get("name") or d.get("id")
+
+
+def _entity_view(st: dict, devices: dict, ents: dict) -> dict:
+    """在实体摘要基础上补充 controllable 标记与所属设备信息。"""
+    v = summarize(st)
+    v.update(_controllability(st.get("entity_id", ""), st.get("state")))
+    eid = str(st.get("entity_id", ""))
+    re = ents.get(eid) or {}
+    did = re.get("device_id")
+    v["device_id"] = did
+    d = devices.get(did) if did else None
+    v["device_name"] = _device_label(d)
+    v["area_id"] = (d.get("area_id") if d else None) or re.get("area_id")
+    return v
+
+
+def _group_by_device(views: list, devices: dict) -> list:
+    """把实体按 device_id 聚合为设备；无 device_id 的实体各自成组。"""
+    groups: dict = {}
+    order: list = []
+    for v in views:
+        did = v.get("device_id")
+        key = did or ("entity:" + str(v.get("entity_id")))
+        g = groups.get(key)
+        if g is None:
+            d = devices.get(did) if did else None
+            g = {
+                "device_id": did,
+                "name": _device_label(d) if d else v.get("name"),
+                "manufacturer": (d.get("manufacturer") if d else None),
+                "model": (d.get("model") if d else None),
+                "area_id": (d.get("area_id") if d else None) or v.get("area_id"),
+                "controllable": False,
+                "entity_count": 0,
+                "entities": [],
+            }
+            groups[key] = g
+            order.append(key)
+        g["entities"].append(v)
+        g["entity_count"] += 1
+        if v.get("controllable"):
+            g["controllable"] = True
+    return [groups[k] for k in order]
 
 
 def snapshot(st: Optional[dict]) -> Optional[dict]:
@@ -270,6 +369,10 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
         return domain, "turn_off", {}
     if a == "toggle":
         return "homeassistant", "toggle", {}
+    if a == "lock":
+        return "lock", "lock", {}
+    if a == "unlock":
+        return "lock", "unlock", {}
     if a == "open":
         if domain == "cover":
             return "cover", "open_cover", {}
@@ -337,44 +440,69 @@ def _hint() -> str:
 
 @mcp.tool()
 async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = None,
+                       controllable_only: bool = False, group_by: str = "entity",
                        limit: Optional[int] = None, offset: int = 0) -> dict:
-    """列出/查询 Home Assistant 中的设备（实体）。
+    """列出/查询 Home Assistant 中的设备。
 
     可按 keyword（设备名称或 entity_id 关键字，模糊匹配）和 domain（设备类型，
     如 light/switch/sensor/climate/cover/media_player/fan/vacuum/scene）过滤；
+    controllable_only=true 只返回可控制的设备；group_by="device" 时按物理设备聚合
+    （一个设备下的多个实体合并为一项，含 manufacturer/model/area 与 entities 列表）；
     结果支持分页：limit 每页条数，offset 起始偏移（默认从 0 开始）。
 
-    适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」。
-    返回包含 total/count/has_more/next_offset 及设备精简列表（entity_id/名称/类型/状态/单位）。
+    每个实体带 controllable（是否可控制）、actions（内置动作）、device_id/device_name/area_id。
+    适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」「哪些设备能控制」。
     """
     try:
         ha = get_ha()
         states = await ha.get_states()
-        items = states
+        try:
+            reg = await ha.get_registries()
+        except HAError:
+            reg = None
+        devices_map, ents_map = _registry_maps(reg)
+        views = [_entity_view(s, devices_map, ents_map) for s in states]
         if domain:
             d = domain.strip().lower()
-            items = [s for s in items if str(s.get("entity_id", "")).startswith(d + ".")]
+            views = [v for v in views if str(v.get("entity_id", "")).startswith(d + ".")]
         if keyword:
             kw = keyword.strip().lower()
-            items = [
-                s for s in items
-                if kw in _friendly_name(s).lower() or kw in str(s.get("entity_id", "")).lower()
+            views = [
+                v for v in views
+                if kw in str(v.get("name", "")).lower()
+                or kw in str(v.get("entity_id", "")).lower()
+                or kw in str(v.get("device_name") or "").lower()
             ]
+        if controllable_only:
+            views = [v for v in views if v.get("controllable")]
+
+        mode = (group_by or "entity").strip().lower()
+        if mode in ("device", "devices", "设备"):
+            items = _group_by_device(views, devices_map)
+            grouped_by = "device"
+        else:
+            items = views
+            grouped_by = "entity"
+
         total = len(items)
         lim = limit if (limit and int(limit) > 0) else DEFAULT_LIST_LIMIT
         lim = min(int(lim), MAX_LIST_LIMIT)
         off = max(0, int(offset or 0))
         page = items[off:off + lim]
-        devices = [summarize(s) for s in page]
         next_off = off + len(page)
         has_more = next_off < total
-        msg = "共 " + str(total) + " 个设备，本次返回 " + str(len(devices)) + " 个"
+        if grouped_by == "device":
+            ent_total = sum(int(g.get("entity_count") or 0) for g in items)
+            msg = "共 " + str(total) + " 个设备（聚合 " + str(ent_total) + " 个实体），本次返回 " + str(len(page)) + " 个"
+        else:
+            msg = "共 " + str(total) + " 个设备，本次返回 " + str(len(page)) + " 个"
         msg += "（还有更多，可用 offset=" + str(next_off) + " 继续）" if has_more else "。"
         return {
-            "ok": True, "total": total, "count": len(devices), "offset": off,
+            "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
+            "total": total, "count": len(page), "offset": off,
             "limit": lim, "has_more": has_more,
             "next_offset": next_off if has_more else None,
-            "devices": devices, "message": msg,
+            "devices": page, "message": msg,
         }
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": _hint()}
@@ -403,7 +531,12 @@ async def get_device_state(entity: str) -> dict:
                         "candidates": names}
             return {"ok": False, "code": "not_found",
                     "message": "未找到设备『" + str(entity) + "』。可先用 list_devices 查询可用设备。"}
-        s = summarize(st)
+        try:
+            reg = await ha.get_registries()
+        except HAError:
+            reg = None
+        devices_map, ents_map = _registry_maps(reg)
+        s = _entity_view(st, devices_map, ents_map)
         s["last_changed"] = st.get("last_changed")
         s["last_updated"] = st.get("last_updated")
         s["attributes"] = st.get("attributes") or {}
@@ -450,6 +583,13 @@ async def control_device(entity: str, action: str, value: Optional[float] = None
                     "message": "未找到设备『" + str(entity) + "』，无法控制。可先用 list_devices 查询。"}
         eid = str(st.get("entity_id"))
         domain = _domain_of(eid)
+        info = _controllability(eid, st.get("state"))
+        if not info["controllable"]:
+            return {
+                "ok": False, "code": "not_controllable",
+                "message": "『" + _friendly_name(st) + "』（" + domain + "）不可控制：" + info["controllable_reason"] + "。",
+                "entity_id": eid, "domain": domain, "actions": info["actions"],
+            }
         sd, svc, extra = build_service(action, domain, value)
         payload = {"entity_id": eid}
         payload.update(extra)
@@ -640,8 +780,11 @@ async def list_domains() -> dict:
             if d:
                 counts[d] = counts.get(d, 0) + 1
         counts = dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+        ctrl = [d for d in counts if DOMAIN_ACTIONS.get(d)]
         msg = "共 " + str(len(counts)) + " 种设备类型：" + ", ".join(k + "(" + str(v) + ")" for k, v in counts.items())
-        return {"ok": True, "domains": counts, "message": msg}
+        if ctrl:
+            msg += "；可控类型：" + ", ".join(ctrl)
+        return {"ok": True, "domains": counts, "controllable_domains": ctrl, "message": msg}
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": _hint()}
     except Exception as e:  # noqa: BLE001

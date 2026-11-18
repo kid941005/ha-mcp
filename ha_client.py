@@ -8,10 +8,19 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import ssl
+import time
 from typing import Any
 
 import httpx
+
+try:  # 设备/实体注册表需通过 HA WebSocket API 读取；缺失时降级为按实体展示
+    import websockets
+except Exception:  # noqa: BLE001
+    websockets = None
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -46,6 +55,12 @@ class HAClient:
         self.verify_ssl = env_bool("HA_VERIFY_SSL", True) if verify_ssl is None else verify_ssl
         # 默认不读取宿主的 HTTP_PROXY/NO_PROXY 等环境变量，避免代理干扰容器内直连 HA。
         self.trust_env = env_bool("HA_TRUST_ENV", False)
+        # 设备/实体注册表：HA 只在 WebSocket API 暴露（REST 无此端点），用于“按设备聚合”。
+        self.ws_url = (os.environ.get("HA_WS_URL") or "").strip() or self._derive_ws_url()
+        self.ws_enabled = env_bool("HA_WS_ENABLED", True)
+        self.registry_ttl = float(os.environ.get("HA_REGISTRY_TTL", "60"))
+        self._registry_cache: dict | None = None
+        self._registry_ts: float = 0.0
         self._validate_config()
 
     def _validate_config(self) -> None:
@@ -136,6 +151,80 @@ class HAClient:
     async def ping(self) -> bool:
         await self._request("GET", "/api/")
         return True
+
+    # ---------------- 设备/实体注册表（WebSocket） ----------------
+    def _derive_ws_url(self) -> str:
+        u = self.base_url
+        if u.startswith("https://"):
+            u = "wss://" + u[len("https://"):]
+        elif u.startswith("http://"):
+            u = "ws://" + u[len("http://"):]
+        return u.rstrip("/") + "/api/websocket"
+
+    def _ws_ssl(self):
+        ctx = ssl.create_default_context()
+        if not self.verify_ssl:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    async def get_registries(self, force: bool = False) -> dict | None:
+        """读取 HA 的设备注册表与实体注册表（带 TTL 缓存）。
+
+        返回 {"devices": [...], "entities": [...]}；WebSocket 不可用/无权限时返回 None，
+        调用方应降级为按实体展示，不影响其它功能。
+        """
+        if not self.ws_enabled or websockets is None:
+            return None
+        now = time.time()
+        if not force and self._registry_cache is not None and (now - self._registry_ts) < self.registry_ttl:
+            return self._registry_cache
+        try:
+            data = await self._ws_registries()
+        except HAError:
+            data = None
+        except Exception:  # noqa: BLE001 注册表仅是增强信息，任何异常都降级
+            data = None
+        self._registry_cache = data
+        self._registry_ts = now
+        return data
+
+    async def _ws_registries(self) -> dict:
+        kwargs: dict = {"open_timeout": self.timeout, "close_timeout": 2}
+        if self.ws_url.startswith("wss://"):
+            kwargs["ssl"] = self._ws_ssl()
+        try:
+            async with websockets.connect(self.ws_url, **kwargs) as ws:
+                hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
+                if hello.get("type") == "auth_required":
+                    await ws.send(json.dumps({"type": "auth", "access_token": self.token}))
+                    auth = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
+                    if auth.get("type") != "auth_ok":
+                        raise HAError("auth_failed", "Home Assistant WebSocket 鉴权失败：请检查 HA_TOKEN 是否有效。")
+                elif hello.get("type") != "auth_ok":
+                    raise HAError("ws_error", "Home Assistant WebSocket 握手异常：" + str(hello.get("type")))
+                cmds = [(1, "config/device_registry/list"), (2, "config/entity_registry/list")]
+                for cid, ctype in cmds:
+                    await ws.send(json.dumps({"id": cid, "type": ctype}))
+                out: dict = {"devices": [], "entities": []}
+                for _ in cmds:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
+                    if msg.get("type") != "result":
+                        continue
+                    if not msg.get("success"):
+                        err = msg.get("error") or {}
+                        raise HAError("registry_error", "读取 Home Assistant 注册表失败：" + str(err.get("message") or err))
+                    if msg.get("id") == 1:
+                        out["devices"] = msg.get("result") or []
+                    elif msg.get("id") == 2:
+                        out["entities"] = msg.get("result") or []
+                return out
+        except asyncio.TimeoutError as e:
+            raise HAError("timeout", "连接 Home Assistant WebSocket 超时。", str(e)) from e
+        except HAError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HAError("ws_error", "连接 Home Assistant WebSocket 失败：" + str(e), str(e)) from e
 
     async def resolve_entity(self, ref: str) -> tuple:
         """把 entity_id 或友好名解析成一个实体。

@@ -10,6 +10,9 @@ PY=${PY:-python}
 export HA_URL=http://127.0.0.1:8123
 export HA_TOKEN="$TEST_TOKEN"
 export FAKE_HA_TOKEN="$TEST_TOKEN"
+# 注册表走 WebSocket（fake 的 WS 端口默认 8124）
+export HA_WS_URL=ws://127.0.0.1:8124/api/websocket
+export FAKE_HA_WS_PORT=8124
 export MCP_PORT=8090
 export MCP_TRANSPORT=streamable-http
 

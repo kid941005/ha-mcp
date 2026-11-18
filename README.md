@@ -5,6 +5,7 @@
 
 > 核心特性：配置只走环境变量（不硬编码）、只读/控制一体化、服务能力自描述（`list_services`）、
 > 通用服务调用（`call_service`，覆盖任意 HA 服务）、控制后三态回读复核（confirmed/no_change/accepted_pending）、
+> 每个实体带 `controllable` 可控标记与 `actions` 动作清单、`group_by="device"` 按物理设备聚合、
 > 错误全部转为中文可读提示且服务不崩溃、设备列表支持过滤与分页。
 
 ---
@@ -16,7 +17,8 @@
   └─> 小智后端（ASR → LLM → function calling）
         └─> MCP 客户端（ServerMCPManager，server_mcp 通道）
               └─> 本服务  /mcp  (streamable-http)
-                    └─> Home Assistant REST API (/api/states、/api/services/...)
+                    ├─> Home Assistant REST API (/api/states、/api/services/...)
+                    └─> Home Assistant WebSocket API (/api/websocket，设备/实体注册表，用于按设备聚合)
                           └─> 真实设备
 ```
 
@@ -62,6 +64,9 @@ ha-mcp/
 | `HA_TIMEOUT` | | `10` | 访问 HA 的超时秒数 |
 | `HA_VERIFY_SSL` | | `true` | 是否校验 HA 的 TLS 证书（自签名证书设 `false`） |
 | `HA_TRUST_ENV` | | `false` | 是否读取宿主 HTTP(S)_PROXY/NO_PROXY（默认关闭，避免代理干扰直连 HA） |
+| `HA_WS_ENABLED` | | `true` | 是否用 WebSocket 读取设备/实体注册表以支持「按设备聚合」 |
+| `HA_WS_URL` | | 由 `HA_URL` 推导 | HA WebSocket 地址，如 `ws://homeassistant:8123/api/websocket` |
+| `HA_REGISTRY_TTL` | | `60` | 设备/实体注册表缓存秒数 |
 | `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `DEFAULT_LIST_LIMIT` | | `50` | `list_devices` 默认每页条数 |
 | `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数（防止一次返回过多） |
@@ -126,12 +131,16 @@ python server.py
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `keyword` | string | 否 | 名称或 entity_id 关键字，模糊匹配（如「客厅」「灯」） |
+| `keyword` | string | 否 | 名称、entity_id 或所属设备名关键字，模糊匹配（如「客厅」「灯」） |
 | `domain` | string | 否 | 设备类型过滤：`light`/`switch`/`sensor`/`climate`/`cover`/`media_player`/`fan`/`vacuum`/`scene` 等 |
+| `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体） |
+| `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合，一个设备的多个实体合并） |
 | `limit` | int | 否 | 每页条数，默认取 `DEFAULT_LIST_LIMIT`，上限 `MAX_LIST_LIMIT` |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
-返回：`{ok,total,count,offset,limit,has_more,next_offset,devices:[{entity_id,name,domain,state,unit,device_class}],message}`
+返回（entity 模式）：`{ok,grouped_by:"entity",registry_available,total,count,offset,limit,has_more,next_offset,devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,device_id,device_name,area_id}],message}`
+返回（device 模式）：`{ok,grouped_by:"device",registry_available,total,count,...,devices:[{device_id,name,manufacturer,model,area_id,controllable,entity_count,entities:[...]}],message}`
+> `registry_available:false` 表示 HA WebSocket 注册表不可用（令牌无权限/WS 不通），此时自动降级为按实体展示，不影响状态查询与控制。
 
 ### 5.2 `get_device_state` — 获取设备状态
 
@@ -139,7 +148,7 @@ python server.py
 |---|---|---|---|
 | `entity` | string | 是 | entity_id（如 `light.living_room`）或友好名称（如「客厅灯」）；服务端自动解析，多义时返回候选 |
 
-返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,last_changed,last_updated},message}`
+返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,controllable,actions,controllable_reason,device_id,device_name,area_id,last_changed,last_updated},message}`
 
 ### 5.3 `control_device` — 控制设备
 
@@ -156,6 +165,7 @@ python server.py
 | `turn_on` / `turn_off` | 开关（cover 自动→ open_cover/close_cover，vacuum → start/stop） | — |
 | `toggle` | 切换 | — |
 | `open` / `close` / `stop` / `pause` / `continue` / `play` | 按设备能力映射 | — |
+| `lock` / `unlock` | 上锁 / 解锁（lock） | — |
 | `set_brightness` | 设置亮度（light） | 1-100 |
 | `set_volume` | 设置音量（media_player） | 1-100 |
 | `volume_mute` / `volume_unmute` | 静音 / 取消静音 | — |
@@ -165,6 +175,7 @@ python server.py
 
 返回：`{ok,entity_id,name,action,service,response_kind,status,expected_state,before,after,changed,message}`
 **控制后三态回读复核**：`status` 为 `confirmed`（确认已变化）/ `no_change`（HA 返回空数组，调用被接受但无变化）/ `accepted_pending`（HA 返回 null，新版 HA 常见，已下发但未观察到变化，附 `expected_state` 乐观预期）。据此避免 HA「对不存在实体也返回 200」造成的静默假成功。
+> 若设备类型本身不可控制（如 `sensor`），返回 `code:"not_controllable"` 并说明原因，不会误发服务。
 
 ### 5.4 `list_services` — 查询设备能力（服务目录）
 
@@ -195,7 +206,7 @@ python server.py
 
 ### 5.6 `list_domains` — 获取设备类型
 
-无参数。返回 `{ok,domains:{light:3,switch:2,...},message}`，便于了解家庭设备类别或选择 `domain` 过滤。
+无参数。返回 `{ok,domains:{light:3,switch:2,...},controllable_domains:["light","switch",...],message}`，便于了解家庭设备类别、哪些类型可控制，或选择 `domain` 过滤。
 
 ---
 
@@ -259,7 +270,9 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 |---|---|---|---|
 | 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":6,"count":6,"has_more":false,"devices":[...]}` |
 | 列出所有的灯 | `list_devices` | `{"domain":"light"}` | `total=1, devices=[{"name":"客厅灯","state":"off"}]` |
-| 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=2` |
+| 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=3` |
+| 哪些设备能控制？ | `list_devices` | `{"controllable_only":true}` | `total=5`（自动排除只读 sensor） |
+| 按物理设备看看家里有什么 | `list_devices` | `{"group_by":"device"}` | `devices=[{"name":"客厅环境组","entity_count":2,"controllable":true,"entities":[...]}] ` |
 | 家里有哪些类型的设备？ | `list_domains` | `{}` | `{"domains":{"light":1,"switch":1,...}}` |
 | 客厅灯现在开着吗？ | `get_device_state` | `{"entity":"客厅灯"}` | `{"ok":true,"entity":{"state":"off","attributes":{...}}}` |
 | 把客厅灯亮度调到 50% | `control_device` | `{"entity":"客厅灯","action":"set_brightness","value":50}` | `{"ok":true,"service":"light.turn_on","changed":true,"after":{"state":"on","brightness":127}}` |
@@ -278,6 +291,8 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 {"ok": false, "code": "not_found", "message": "未找到设备『不存在设备』，无法控制。可先用 list_devices 查询。"}
 // 动作不支持
 {"ok": false, "code": "unsupported_action", "message": "不支持的控制动作：fly。可用动作：turn_on, turn_off, ..."}
+// 设备不可控制（如传感器）
+{"ok": false, "code": "not_controllable", "message": "『客厅温度』（sensor）不可控制：该类型无内置控制动作..."}
 ```
 
 ---
@@ -294,6 +309,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | `timeout` | 请求 HA 超时 | 增大 `HA_TIMEOUT` 或检查网络/HA 负载 |
 | `upstream_error` | HA 5xx | 查看 HA 自身日志/健康状况 |
 | `not_found` | 实体/资源不存在 | 用 `list_devices` 查正确 entity_id |
+| `not_controllable` | 设备类型无内置控制动作（如 sensor） | 只用 `get_device_state` 查询，或 `list_services` 后用 `call_service` |
 | `ambiguous` | 名称匹配到多个设备 | 改用更精确名称或 entity_id |
 | `missing_value` / `invalid_value` | 动作缺参数或取值越界 | 按工具描述传 1-100 等合法值 |
 | `unsupported_action` | 动作不支持 | 使用 `SUPPORTED_ACTIONS` 中的动作 |
@@ -317,6 +333,9 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
    - Linux 下可加 `--add-host=host.docker.internal:host-gateway`。
 5. **TLS**：自签名证书导致 `SSLError` 时设 `HA_VERIFY_SSL=false`（仅受信网络）。
 6. **代理**：若宿主设置了 `HTTP_PROXY/NO_PROXY` 干扰直连，保持 `HA_TRUST_ENV=false`（默认）。
+7. **按设备聚合不可用**：`list_devices(group_by="device")` 依赖 HA WebSocket `config/device_registry/list`。
+   若返回 `registry_available:false`（令牌无权限、WS 被代理/防火墙拦截），会自动降级为按实体展示；
+   可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
 
 > 已知 HA 行为：对**不存在的实体**调用 service 也会返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
 > 本服务在 `control_device` / `call_service` 后执行**三态回读复核**：`response_kind`(states/empty/none) + `status`(confirmed/no_change/accepted_pending) + `changed`，避免误报成功。
@@ -344,13 +363,14 @@ python tests/fake_ha.py
 # 终端 2：启动本服务并指向模拟 HA（HA_TOKEN 与模拟器一致）
 export HA_URL=http://127.0.0.1:8123
 export HA_TOKEN=任意本地测试口令
+export HA_WS_URL=ws://127.0.0.1:8124/api/websocket   # 注册表 WS（fake_ha 默认 8124）
 python server.py
 
 # 终端 3：用真实 MCP 客户端跑端到端用例
 python tests/e2e_mcp_client.py
 ```
 
-`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，用于验证回读复核逻辑。
+`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，用于验证回读复核逻辑；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。
 
 ---
 
@@ -361,6 +381,7 @@ python tests/e2e_mcp_client.py
   若你的小智版本/入口不同，按第 6 节对应调整即可。
 - **设备较多时的返回规模**：`list_devices` 支持 `keyword`/`domain` 过滤 + `limit`/`offset` 分页
   （默认 50、上限 500），避免实体过多撑爆上下文；返回含 `has_more`/`next_offset` 便于续拉。
+  另提供 `group_by="device"` 按物理设备聚合、`controllable_only=true` 只看可控设备，进一步压缩结果。
 - 其余未提供的信息未做假设；如需与特定小智版本/回调协议对接，请补充说明。
 
 ---
