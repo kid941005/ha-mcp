@@ -1,9 +1,8 @@
-# homeassistant-xiaozhiserver — 小智 MCP 服务（Home Assistant 桥），独立构建运行
-# 用法：cp .env.example .env 并填写 HA_URL/HA_TOKEN，然后 docker compose up -d --build
+# homeassistant-xiaozhiserver — 小智 MCP 服务（Home Assistant 桥），使用 GHCR 预构建镜像
+# 用法：cp .env.example .env 并填写 HA_URL/HA_TOKEN，然后 docker compose pull && docker compose up -d
 services:
   homeassistant-xiaozhiserver:
-    build: .
-    image: homeassistant-xiaozhiserver:latest
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.6.0
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     env_file:

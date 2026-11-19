@@ -150,16 +150,19 @@ homeassistant-xiaozhiserver/
 
 ## 5. 快速开始
 
-### 5.1 Docker Compose（推荐）
+### 5.1 Docker Compose（推荐，使用 GHCR 镜像）
 
 ```bash
 cd homeassistant-xiaozhiserver
 cp .env.example .env
 # 编辑 .env，填入 HA_URL 与 HA_TOKEN
-docker compose up -d --build
+docker compose pull homeassistant-xiaozhiserver
+docker compose up -d homeassistant-xiaozhiserver
 docker compose logs -f
 curl -s http://127.0.0.1:8090/ready
 ```
+
+> 镜像来自 GHCR，无需本地构建；需要从源码构建时使用 5.2 的 `docker build`。
 
 `/ready` 返回 `{"status":"ok",...,"ha":"reachable"}` 表示 MCP 服务已启动且 HA 可达。
 
