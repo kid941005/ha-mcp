@@ -199,13 +199,11 @@ python -m homeassistant_xiaozhiserver
 
 ### 5.4 并入现有 deploy compose
 
-本项目实际部署目录为 `D:/dsh/esp32/deploy`。`deploy/docker-compose.yml` 已追加 `homeassistant-xiaozhiserver` 服务，关键配置如下：
+本项目实际部署目录为 `D:/dsh/esp32/deploy`。`deploy/docker-compose.yml` 已追加 `homeassistant-xiaozhiserver` 服务，镜像直接使用 GHCR 预构建镜像，关键配置如下：
 
 ```yaml
   homeassistant-xiaozhiserver:
-    build:
-      context: ../homeassistant-xiaozhiserver
-    image: homeassistant-xiaozhiserver:latest
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.6.0
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     environment:
@@ -226,7 +224,8 @@ python -m homeassistant_xiaozhiserver
 
 ```bash
 cd deploy
-docker compose up -d --build homeassistant-xiaozhiserver
+docker compose pull homeassistant-xiaozhiserver
+docker compose up -d homeassistant-xiaozhiserver
 docker compose ps homeassistant-xiaozhiserver
 ```
 
