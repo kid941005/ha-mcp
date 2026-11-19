@@ -1,14 +1,14 @@
 # 【片段，不是完整 compose 文件】
 # 把下面这段（2 空格缩进）粘贴进 deploy/docker-compose.yml 的 services: 下，
-# 与 xiaozhi-server 处于同一默认网络，xiaozhi 即可用 http://ha-mcp:8090/mcp 直连。
-# build.context 视 ha-mcp 目录相对 deploy/ 的位置调整。
+# 与 xiaozhi-server 处于同一默认网络，xiaozhi 即可用 http://homeassistant-xiaozhiserver:8090/mcp 直连。
+# build.context 视 homeassistant-xiaozhiserver 目录相对 deploy/ 的位置调整。
 
-  # ========== 小智 MCP 服务（Home Assistant 桥）==========
-  ha-mcp:
+  # ========== homeassistant-xiaozhiserver（小智 MCP 服务）==========
+  homeassistant-xiaozhiserver:
     build:
-      context: ../ha-mcp
-    image: ha-mcp:latest
-    container_name: ha-mcp
+      context: ../homeassistant-xiaozhiserver
+    image: homeassistant-xiaozhiserver:latest
+    container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai

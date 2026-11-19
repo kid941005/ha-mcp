@@ -1,128 +1,184 @@
-# 小智 MCP 服务（Home Assistant 桥）
+# homeassistant-xiaozhiserver
 
-把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
-供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言调用，支持 Docker 一键部署。
+> 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
+> 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言查询与控制，支持 Docker 一键部署。
 
-> 核心特性：配置只走环境变量（不硬编码）、只读/控制一体化、服务能力自描述（`list_services`）、
-> 通用服务调用（`call_service`，覆盖任意 HA 服务）、控制后状态+属性四态回读校验（confirmed/no_change/mismatch/accepted_pending）、
-> 危险设备（门锁/安防面板/车库门/门窗类 cover）二次确认令牌防误操作、
-> 每个实体带 `controllable` 可控标记、`dangerous` 危险标记与 `actions` 动作清单、`group_by="device"` 按物理设备聚合、
-> 错误全部转为中文可读提示且服务不崩溃、设备列表支持过滤与分页。
+当前版本：**v1.6.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
 
 ---
 
-## 1. 架构与数据流
+## 目录
+
+1. [功能特性](#1-功能特性)
+2. [架构与数据流](#2-架构与数据流)
+3. [目录结构](#3-目录结构)
+4. [环境变量](#4-环境变量)
+5. [快速开始](#5-快速开始)
+6. [MCP 工具](#6-mcp-工具)
+7. [接入小智后端](#7-接入小智后端)
+8. [自然语言使用示例](#8-自然语言使用示例)
+9. [错误处理与排查](#9-错误处理与排查)
+10. [离线测试](#10-离线测试)
+11. [设备规模与性能](#11-设备规模与性能)
+12. [安全建议](#12-安全建议)
+13. [版本记录](#13-版本记录)
+
+---
+
+## 1. 功能特性
+
+| 能力 | 说明 |
+|---|---|
+| 六个 MCP 工具 | `list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains`，名称、描述与参数均面向自然语言路由设计 |
+| 设备发现与状态 | 支持按名称/entity_id 模糊查询，按 `domain` 过滤，支持分页；状态查询默认裁剪为关键属性，避免上下文膨胀 |
+| 常用控制 | 开关、亮度、音量、温度、色温、颜色、窗帘、门锁等常用动作，按设备 domain 自动映射到对应 HA 服务 |
+| 能力自描述 | `list_services` 查询某类或某个设备支持哪些服务及参数字段，先看能力再调用 |
+| 通用服务调用 | `call_service` 可执行任意 HA 服务，覆盖 `control_device` 未封装的能力 |
+| 控制后回读校验 | 调用后轮询回读状态与属性，返回 `confirmed` / `no_change` / `mismatch` / `accepted_pending` 四态，避免静默假成功 |
+| 危险设备二次确认 | 门锁、安防面板、车库门/门窗类 cover 首次调用只返回一次性 `confirm_token`，用户确认后再次调用才执行 |
+| 可控与危险标记 | 每个实体带 `controllable`、`actions`、`dangerous`、`danger_reason`；`list_domains` 汇总危险实体 |
+| 按物理设备聚合 | `group_by="device"` 通过 HA WebSocket 注册表把同一设备的多个实体合并展示；注册表不可用时自动降级为按实体展示 |
+| 健壮错误处理 | 所有工具返回结构化 JSON；失败给 `code` / `message` / `hint`，不抛异常堆栈、不使服务崩溃 |
+| 配置安全 | `HA_URL` / `HA_TOKEN` 只从环境变量读取，不写入镜像或代码 |
+| 离线可测 | 自带 fake HA 模拟器与端到端测试，无需真实 Home Assistant 即可验证全部工具 |
+
+---
+
+## 2. 架构与数据流
 
 ```
 用户语音
   └─> 小智后端（ASR → LLM → function calling）
         └─> MCP 客户端（ServerMCPManager，server_mcp 通道）
               └─> 本服务  /mcp  (streamable-http)
-                    ├─> Home Assistant REST API (/api/states、/api/services/...)
-                    └─> Home Assistant WebSocket API (/api/websocket，设备/实体注册表，用于按设备聚合)
-                          └─> 真实设备
+                    ├─> Home Assistant REST API
+                    │     ├─ GET  /api/states                 读取实体状态
+                    │     ├─ GET  /api/services               读取服务目录
+                    │     └─ POST /api/services/{domain}/{service}  执行控制
+                    └─> Home Assistant WebSocket API
+                          └─ /api/websocket（设备/实体注册表，用于按设备聚合）
+                                └─> 真实设备
 ```
 
-- 小智后端启动时对本服务做 `list_tools`，把工具定义并入 LLM 的 function 列表；
-- 用户自然语言 → LLM 选择工具与参数 → 小智后端 `call_tool` → 本服务翻译为 HA REST 调用 → 返回给 LLM 生成回复；
-- 本服务不持久化业务数据；设备注册表采用进程内 TTL 缓存，危险确认令牌也保存在单进程内存，因此**当前按单实例部署**（多副本需共享令牌或改用签名令牌方案）；只从环境变量读取 `HA_URL` / `HA_TOKEN`。
+一次典型调用：
+
+1. 小智后端启动时对本服务执行 `list_tools`，把工具定义并入 LLM 的 function 列表；
+2. 用户说话 → ASR 转文本 → LLM 选择工具与参数；
+3. 小智后端 `call_tool` → 本服务调用 HA REST/WS → 返回结构化结果；
+4. LLM 根据结果生成自然语言回复。
+
+> 本服务不持久化业务数据。设备/实体注册表是进程内 TTL 缓存，危险确认令牌也是单进程内存，因此默认按**单实例**部署；多副本场景需要额外共享令牌或改用签名令牌方案。
 
 ---
 
-## 2. 目录结构
+## 3. 目录结构
 
 ```
-ha-mcp/
-├── ha_mcp/                                # Python 包（应用代码）
+homeassistant-xiaozhiserver/
+├── homeassistant_xiaozhiserver/                          # Python 包（应用代码）
 │   ├── __init__.py
-│   ├── __main__.py                        # python -m ha_mcp 入口
-│   ├── config.py                          # 环境变量解析与运行常量（非法值回退）
-│   ├── client.py                          # HA REST/WS 客户端 / 错误处理 / 实体解析
-│   ├── service.py                         # 动作映射 / 状态与属性预期 / 回读校验
-│   ├── danger.py                          # 危险设备判定 / 一次性确认令牌
-│   ├── views.py                           # 实体摘要 / 可控标记 / 按设备聚合
-│   └── server.py                          # MCP 工具定义 + 健康检查 + 入口
-├── server.py                              # 兼容入口（等价于 python -m ha_mcp）
+│   ├── __main__.py                  # python -m homeassistant_xiaozhiserver 入口
+│   ├── config.py                    # 环境变量解析与运行常量（非法值告警并回退）
+│   ├── client.py                    # HA REST/WebSocket 客户端、鉴权与错误归一化
+│   ├── service.py                   # 动作映射、状态/属性预期、回读校验
+│   ├── danger.py                    # 危险设备判定、一次性确认令牌
+│   ├── views.py                     # 实体摘要、可控标记、按设备聚合
+│   └── server.py                    # MCP 工具定义、健康检查、进程入口
+├── server.py                        # 兼容入口（等价于 python -m homeassistant_xiaozhiserver）
 ├── requirements.txt
 ├── Dockerfile
-├── docker-compose.yml                     # 独立构建运行
+├── docker-compose.yml               # 独立构建运行
 ├── .env.example
 ├── integration/
-│   ├── .mcp_server_settings.json          # 小智后端「服务端 MCP」配置样例
-│   └── docker-compose.ha-mcp.fragment.yml # 并入现有 deploy compose 的片段
+│   ├── .mcp_server_settings.json    # 小智后端「服务端 MCP」配置样例
+│   └── docker-compose.homeassistant-xiaozhiserver.fragment.yml
 ├── tests/
-│   ├── fake_ha.py                         # 离线 HA 模拟器（含静默假成功复刻）
-│   ├── e2e_mcp_client.py                  # 端到端 MCP 客户端测试
+│   ├── fake_ha.py                   # 离线 HA 模拟器
+│   ├── e2e_mcp_client.py            # 端到端 MCP 客户端断言测试
 │   └── run_local_test.sh
 └── README.md
 ```
 
+模块职责：
+
+| 模块 | 职责 |
+|---|---|
+| `config.py` | 集中解析环境变量；`env_str` / `env_bool` / `env_int` / `env_float` / `env_set`，非法值不会导致 import 崩溃 |
+| `client.py` | 封装 HA REST 与 WebSocket；统一 `HAError` 错误码；连接池复用；注册表 TTL 与失败短重试 |
+| `service.py` | 动作 → HA 服务映射；预期状态/属性推导；控制后四态回读校验 |
+| `danger.py` | 判断危险设备；签发/消费一次性 `confirm_token`，绑定实体、服务与参数 |
+| `views.py` | 实体视图、关键属性裁剪、可控性/危险标记、按物理设备聚合 |
+| `server.py` | 六个 MCP 工具；`/health` 与 `/ready`；传输方式与进程入口 |
+
 ---
 
-## 3. 环境变量清单
+## 4. 环境变量
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `HA_URL` | ✅ | — | Home Assistant 地址，如 `https://your-ha.example:8123`（结尾不要带 `/`） |
 | `HA_TOKEN` | ✅ | — | HA 长期访问令牌（个人资料 → 安全 → 长期访问令牌） |
-| `MCP_TRANSPORT` | | `streamable-http` | `streamable-http` / `sse` / `stdio` |
+| `MCP_TRANSPORT` | | `streamable-http` | `streamable-http` / `sse` / `stdio`；其它值启动时报错退出 |
 | `MCP_HOST` | | `0.0.0.0` | 监听地址 |
 | `MCP_PORT` | | `8090` | 监听端口 |
 | `MCP_PATH` | | `/mcp` | streamable-http 路径 |
-| `MCP_SSE_PATH` | | `/sse` | sse 路径（仅 sse 传输时用） |
+| `MCP_SSE_PATH` | | `/sse` | sse 路径（仅 sse 传输时使用） |
 | `MCP_STATELESS` | | `false` | 是否使用无状态 HTTP 传输（仅传输层；多副本仍需共享危险确认令牌/注册表缓存） |
 | `HA_TIMEOUT` | | `10` | 访问 HA 的超时秒数 |
 | `HA_VERIFY_SSL` | | `true` | 是否校验 HA 的 TLS 证书（自签名证书设 `false`） |
-| `HA_TRUST_ENV` | | `false` | 是否读取宿主 HTTP(S)_PROXY/NO_PROXY（默认关闭，避免代理干扰直连 HA） |
-| `HA_WS_ENABLED` | | `true` | 是否用 WebSocket 读取设备/实体注册表以支持「按设备聚合」 |
+| `HA_TRUST_ENV` | | `false` | 是否读取宿主 HTTP(S)_PROXY/NO_PROXY；默认关闭，避免代理干扰直连 HA |
+| `HA_WS_ENABLED` | | `true` | 是否用 WebSocket 读取设备/实体注册表以支持按设备聚合 |
 | `HA_WS_URL` | | 由 `HA_URL` 推导 | HA WebSocket 地址，如 `ws://homeassistant:8123/api/websocket` |
 | `HA_REGISTRY_TTL` | | `60` | 设备/实体注册表成功缓存秒数 |
-| `HA_REGISTRY_ERROR_TTL` | | `10` | 注册表读取失败后的重试间隔（秒），避免瞬时 WS 故障后长时间不重试 |
+| `HA_REGISTRY_ERROR_TTL` | | `10` | 注册表读取失败后的重试间隔，避免瞬时 WS 故障后长时间不重试 |
 | `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `DEFAULT_LIST_LIMIT` | | `50` | `list_devices` 默认每页条数 |
-| `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数（防止一次返回过多） |
-| `SERVICE_CONFIRM_DELAY` | | `0.6` | 服务调用后回读前的等待秒数（等待设备状态刷新） |
-| `SERVICE_CONFIRM_RETRIES` | | `1` | 服务调用后回读的额外重试次数 |
+| `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数 |
+| `SERVICE_CONFIRM_DELAY` | | `0.6` | 服务调用后回读前的等待秒数 |
+| `SERVICE_CONFIRM_RETRIES` | | `1` | 回读的额外重试次数 |
 | `SERVICE_CONFIRM_INTERVAL` | | 同 `SERVICE_CONFIRM_DELAY` | 回读轮询间隔秒数 |
-| `SERVICE_CONFIRM_TIMEOUT` | | `4.0` | 回读确认总超时秒数（窗口内持续轮询直到匹配预期） |
-| `DANGER_CONFIRM_ENABLED` | | `true` | 是否对危险设备启用二次确认（设 `false` 可关闭） |
+| `SERVICE_CONFIRM_TIMEOUT` | | `4.0` | 回读确认总超时秒数 |
+| `DANGER_CONFIRM_ENABLED` | | `true` | 是否对危险设备启用二次确认 |
 | `DANGER_CONFIRM_TTL` | | `120` | 危险操作确认令牌有效期（秒），一次性使用 |
 | `DANGEROUS_DOMAINS` | | `lock,alarm_control_panel` | 视为危险设备的 domain（逗号分隔） |
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
 
-> 安全：`HA_TOKEN` 只通过环境变量注入，不写入镜像、不写入代码、不写进 Git。
+> 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
+> 安全：`HA_TOKEN` 只通过环境变量注入，不写入镜像、代码或 Git。
 
 ---
 
-## 4. 快速开始
+## 5. 快速开始
 
-### 4.1 Docker Compose（推荐）
+### 5.1 Docker Compose（推荐）
 
 ```bash
-cd ha-mcp
+cd homeassistant-xiaozhiserver
 cp .env.example .env
 # 编辑 .env，填入 HA_URL 与 HA_TOKEN
 docker compose up -d --build
-docker compose logs -f          # 观察启动日志
-curl -s http://127.0.0.1:8090/ready    # 应返回 {"status":"ok",...,"ha":"reachable"}
+docker compose logs -f
+curl -s http://127.0.0.1:8090/ready
 ```
 
-### 4.2 docker build / run
+`/ready` 返回 `{"status":"ok",...,"ha":"reachable"}` 表示 MCP 服务已启动且 HA 可达。
+
+### 5.2 docker build / run
 
 ```bash
-docker build -t ha-mcp:latest .
+docker build -t homeassistant-xiaozhiserver:latest .
 
-docker run -d --name ha-mcp \
+docker run -d --name homeassistant-xiaozhiserver \
   -p 8090:8090 \
   -e HA_URL=https://your-ha.example:8123 \
   -e HA_TOKEN=你的HA长期访问令牌 \
   --restart unless-stopped \
-  ha-mcp:latest
+  homeassistant-xiaozhiserver:latest
 ```
 
-> 若 HA 用的是自签名证书，追加 `-e HA_VERIFY_SSL=false`。
+> HA 使用自签名证书时追加 `-e HA_VERIFY_SSL=false`。
 
-### 4.3 本地开发（无 Docker）
+### 5.3 本地开发（无 Docker）
 
 ```bash
 python -m venv .venv
@@ -130,61 +186,102 @@ python -m venv .venv
 pip install -r requirements.txt
 export HA_URL=https://your-ha.example:8123
 export HA_TOKEN=你的HA长期访问令牌
-python -m ha_mcp
+python -m homeassistant_xiaozhiserver
 ```
 
 服务启动后：
-- MCP 端点：`http://<host>:8090/mcp`（streamable-http）
-- 健康检查：`http://<host>:8090/health`（liveness）/ `http://<host>:8090/ready`（readiness）
+
+| 地址 | 用途 |
+|---|---|
+| `http://<host>:8090/mcp` | MCP streamable-http 端点 |
+| `http://<host>:8090/health` | liveness：仅表示 MCP 进程/HTTP 服务在运行，不依赖 HA |
+| `http://<host>:8090/ready` | readiness：HA 可达且鉴权通过才返回 200，否则 503 |
+
+### 5.4 并入现有 deploy compose
+
+本项目实际部署目录为 `D:/dsh/esp32/deploy`。`deploy/docker-compose.yml` 已追加 `homeassistant-xiaozhiserver` 服务，关键配置如下：
+
+```yaml
+  homeassistant-xiaozhiserver:
+    build:
+      context: ../homeassistant-xiaozhiserver
+    image: homeassistant-xiaozhiserver:latest
+    container_name: homeassistant-xiaozhiserver
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - HA_URL=${HA_URL:?set HA_URL in deploy/.env}
+      - HA_TOKEN=${HA_TOKEN:?set HA_TOKEN in deploy/.env}
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MCP_PORT','8090')+'/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
+在 `deploy/.env` 中补充 `HA_URL` 与 `HA_TOKEN` 后执行：
+
+```bash
+cd deploy
+docker compose up -d --build homeassistant-xiaozhiserver
+docker compose ps homeassistant-xiaozhiserver
+```
+
+`homeassistant-xiaozhiserver` 与 `xiaozhi-esp32-server` 同处默认网络，小智后端可以直接访问 `http://homeassistant-xiaozhiserver:8090/mcp`。
 
 ---
 
-## 5. MCP 工具说明
+## 6. MCP 工具
 
-所有工具返回 **JSON**（结构统一为 `{"ok": true/false, ...}`），便于大模型直接理解。
-失败时 `ok=false` 并带 `code` / `message` / `hint`，**不会抛异常堆栈**。
+所有工具返回 **JSON**，统一结构为 `{"ok": true/false, ...}`。失败时 `ok=false` 并带 `code` / `message` / `hint`，不会抛出异常堆栈。
 
-### 5.1 `list_devices` — 获取设备列表
+### 6.1 `list_devices` — 获取设备列表
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `keyword` | string | 否 | 名称、entity_id 或所属设备名关键字，模糊匹配（如「客厅」「灯」） |
-| `domain` | string | 否 | 设备类型过滤：`light`/`switch`/`sensor`/`climate`/`cover`/`media_player`/`fan`/`vacuum`/`scene` 等 |
+| `domain` | string | 否 | 设备类型过滤：`light` / `switch` / `sensor` / `climate` / `cover` / `media_player` / `fan` / `vacuum` / `scene` 等 |
 | `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体） |
-| `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合，一个设备的多个实体合并） |
-| `limit` | int | 否 | 每页条数，默认取 `DEFAULT_LIST_LIMIT`，上限 `MAX_LIST_LIMIT` |
+| `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合） |
+| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`，上限 `MAX_LIST_LIMIT` |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
-返回（entity 模式）：`{ok,grouped_by:"entity",registry_available,total,count,offset,limit,has_more,next_offset,devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id}],message}`
-返回（device 模式）：`{ok,grouped_by:"device",registry_available,total,count,...,devices:[{device_id,name,manufacturer,model,area_id,controllable,dangerous,entity_count,entities:[...]}],message}`
-> `registry_available:false` 表示 HA WebSocket 注册表不可用（令牌无权限/WS 不通），此时自动降级为按实体展示，不影响状态查询与控制。
+返回（entity 模式）：`{ok, grouped_by:"entity", registry_available, total, count, offset, limit, has_more, next_offset, devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id}], message}`。
 
-### 5.2 `get_device_state` — 获取设备状态
+返回（device 模式）：`{ok, grouped_by:"device", registry_available, total, count, offset, limit, has_more, next_offset, devices:[{device_id,name,manufacturer,model,area_id,controllable,dangerous,entity_count,entities:[...]}], message}`。
+
+> `registry_available:false` 表示 HA WebSocket 注册表不可用（令牌无权限、WS 不通等），此时自动降级为按实体展示，不影响状态查询与控制。
+
+### 6.2 `get_device_state` — 获取设备状态
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `entity` | string | 是 | entity_id（如 `light.living_room`）或友好名称（如「客厅灯」）；服务端自动解析，多义时返回候选 |
-| `include_all_attributes` | bool | 否 | 默认 `false` 只返回关键属性；需要完整 `attributes` 时传 `true` |
+| `include_all_attributes` | bool | 否 | 默认 `false` 只返回关键属性；需要完整 attributes 时传 `true` |
 
-返回：`{ok,entity:{entity_id,name,domain,state,unit,attributes,attributes_truncated,attribute_count,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,last_changed,last_updated},message}`
-默认只返回亮度/色温/音量/温度/位置/电池等关键属性，避免媒体、摄像头等实体的巨大 attributes 占用上下文；`attributes_truncated=true` 表示还有更多属性。
+返回：`{ok, entity:{entity_id,name,domain,state,unit,attributes,attributes_truncated,attribute_count,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,last_changed,last_updated}, message}`。
 
-### 5.3 `control_device` — 控制设备
+默认只返回亮度、色温、音量、温度、位置、电池等关键属性，避免媒体/摄像头等实体的巨大 attributes 占用上下文；`attributes_truncated=true` 表示还有更多属性。
+
+### 6.3 `control_device` — 控制设备
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `entity` | string | 是 | 目标设备：entity_id 或友好名称 |
-| `action` | string | 是 | 见下表 |
-| `value` | number / string / array | 视动作 | 亮度/音量百分比(1-100)、温度(℃)、色温(K)；颜色支持 `#RRGGBB`、`"r,g,b"` 或 `[r,g,b]` |
+| `action` | string | 是 | 动作，见下表 |
+| `value` | number / string / array | 视动作 | 亮度/音量百分比（1-100）、温度（℃）、色温（K）；颜色支持 `#RRGGBB`、`"r,g,b"` 或 `[r,g,b]` |
 | `confirm_token` | string | 危险设备时 | 危险设备二次确认令牌（首次调用返回，用户确认后再带此参数重试） |
 
-`action` 取值（服务端按设备 domain 自动映射到 HA 服务）：
+通用动作：
 
 | action | 作用 | 需要的 value |
 |---|---|---|
-| `turn_on` / `turn_off` | 开关（cover 自动→ open_cover/close_cover，vacuum → start/stop） | — |
+| `turn_on` / `turn_off` | 开关；cover 自动映射 `open_cover` / `close_cover`，vacuum 映射 `start` / `stop` | — |
 | `toggle` | 切换 | — |
-| `open` / `close` / `stop` / `pause` / `continue` / `play` | 按设备能力映射 | — |
+| `open` / `close` / `stop` / `pause` / `continue` / `play` | 按设备能力映射到对应服务 | — |
 | `lock` / `unlock` | 上锁 / 解锁（lock） | — |
 | `set_brightness` | 设置亮度（light） | 1-100 |
 | `set_volume` | 设置音量（media_player） | 1-100 |
@@ -193,33 +290,52 @@ python -m ha_mcp
 | `set_color_temp` | 设置色温（light） | 开尔文 |
 | `set_color` | 设置颜色（light） | `#RRGGBB`、`"r,g,b"` 或 `[r,g,b]` |
 
-返回：`{ok,entity_id,name,action,service,response_kind,status,expected_state,before,after,changed,verified,verification,message}`
-**控制后状态+属性回读校验**：服务调用后会在 `SERVICE_CONFIRM_TIMEOUT` 秒内轮询回读，既核对状态（如 turn_on→on），也核对属性（亮度、温度、音量、色温、颜色等），`status` 为：
-- `confirmed`：回读确认状态/属性已达到预期（且确有变化）；
-- `no_change`：HA 已接受但无变化；若 `verified=true` 表示设备本来就是目标状态；
-- `mismatch`：回读看到变化，但状态或属性与预期不符（设备能力/参数问题）；
-- `accepted_pending`：HA 返回 null（新版 HA 常见），已下发但回读窗口内仍未完全匹配。
-`verification` 给出 `attempts`（回读次数）、`elapsed_ms`、`expectations`、`checks`、`mismatches`，便于调用方判断是否真正生效，避免 HA「对不存在实体也返回 200」造成的静默假成功。
+各设备类型内置动作：
+
+| domain | 内置动作 |
+|---|---|
+| light | turn_on, turn_off, toggle, set_brightness, set_color_temp, set_color |
+| switch / fan / input_boolean / automation | turn_on, turn_off, toggle |
+| cover | open, close, stop, turn_on, turn_off |
+| climate | turn_on, turn_off, set_temperature |
+| media_player | turn_on, turn_off, play, pause, stop, continue, set_volume, volume_mute, volume_unmute |
+| vacuum | turn_on, turn_off, stop, pause, continue |
+| lock | lock, unlock |
+| scene / script | turn_on |
+
+返回：`{ok, entity_id, name, action, service, response_kind, status, expected_state, before, after, changed, verified, verification, message}`。
+
+**控制后状态+属性回读校验**：服务调用后会在 `SERVICE_CONFIRM_TIMEOUT` 秒内轮询回读，既核对状态（如 turn_on→on），也核对属性（亮度、温度、音量、色温、颜色等）。`status` 为：
+
+| status | 含义 |
+|---|---|
+| `confirmed` | 回读确认状态/属性已达到预期，且确有变化 |
+| `no_change` | HA 已接受但无变化；`verified=true` 表示设备本来就是目标状态 |
+| `mismatch` | 回读看到变化，但状态或属性与预期不符（设备能力/参数问题） |
+| `accepted_pending` | HA 返回 null（新版 HA 常见），已下发但回读窗口内仍未完全匹配 |
+
+`verification` 给出 `attempts`（回读次数）、`elapsed_ms`、`expectations`、`checks`、`mismatches`，便于判断是否真正生效，避免 HA「对不存在实体也返回 200」造成的静默假成功。
+
 > 若设备类型本身不可控制（如 `sensor`），返回 `code:"not_controllable"` 并说明原因，不会误发服务。
 
-> **危险设备二次确认（防误操作）**：`lock`、`alarm_control_panel` 以及 device_class 为 `garage`/`door`/`gate`/`window` 的 `cover` 默认视为危险设备。首次调用会返回 `code:"confirmation_required"`、`dangerous:true`、`requires_confirmation:true`、`confirm_token`、`expires_in` 与 `risk_reason`，**不会执行**；请先向用户明确确认动作，再带同一个 `confirm_token` 重试。令牌**一次性**、绑定“实体 + 服务 + 参数”，默认 `DANGER_CONFIRM_TTL=120` 秒有效；令牌无效/过期/操作不匹配分别返回 `invalid_confirm_token` / `confirm_token_expired` / `confirm_token_mismatch`。
+> **危险设备二次确认（防误操作）**：`lock`、`alarm_control_panel` 以及 device_class 为 `garage` / `door` / `gate` / `window` 的 `cover` 默认视为危险设备。首次调用会返回 `code:"confirmation_required"`、`dangerous:true`、`requires_confirmation:true`、`confirm_token`、`expires_in` 与 `risk_reason`，**不会执行**；请先向用户明确确认动作，再带同一个 `confirm_token` 重试。令牌**一次性**、绑定「实体 + 服务 + 参数」，默认 `DANGER_CONFIRM_TTL=120` 秒有效；令牌无效/过期/操作不匹配分别返回 `invalid_confirm_token` / `confirm_token_expired` / `confirm_token_mismatch`。
 
-### 5.4 `list_services` — 查询设备能力（服务目录）
+### 6.4 `list_services` — 查询设备能力（服务目录）
 
 让调用方先了解「某类/某个设备支持哪些服务、每个服务要什么参数」，再精确调用（能力自描述）。
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `entity` | string | 否 | 设备 entity_id 或友好名称；给出时只返回该设备所属 domain 的服务 |
-| `domain` | string | 否 | 直接指定设备类型（如 `light`/`climate`/`media_player`） |
+| `domain` | string | 否 | 直接指定设备类型（如 `light` / `climate` / `media_player`） |
 | `keyword` | string | 否 | 按服务名或描述关键字过滤（如 `temperature`） |
 | `detailed` | bool | 否 | 是否返回字段参数明细（指定 entity/domain 时默认 true，否则仅名称） |
 
-返回：`{ok,domain,domain_count,service_count,domains:[{domain,service_count,services:[...]}],message}`。
-`detailed=true` 时 `services` 为对象列表（`service/name?/description?/fields?`），否则为服务名字符串列表。
-数据源为 HA `GET /api/services`。
+返回：`{ok, domain, domain_count, service_count, domains:[{domain, service_count, services:[...]}], message}`。
 
-### 5.5 `call_service` — 通用服务调用
+`detailed=true` 时 `services` 为对象列表（`service` / `name` / `description` / `fields`），否则为服务名字符串列表。数据源为 HA `GET /api/services`。
+
+### 6.5 `call_service` — 通用服务调用
 
 执行 `control_device` 未封装的任意 HA 服务（如空调模式、风扇风速、自定义脚本）。
 
@@ -227,41 +343,42 @@ python -m ha_mcp
 |---|---|---|---|
 | `entity` | string | 是 | 目标设备：entity_id 或友好名称 |
 | `service` | string | 是 | 服务名：`turn_on`（默认用设备 domain）或 `climate.set_hvac_mode`（显式带 domain 以它为准） |
-| `data` | object | 否 | 额外参数 JSON，如 `{"temperature":26}`、`{"hvac_mode":"heat"}`、`{"rgb_color":[255,0,0]}` |
+| `data` | object | 否 | 额外参数 JSON，如 `{"temperature":26}`、`{"hvac_mode":"heat"}`、`{"rgb_color":[255,0,0]}`；不要包含 `entity_id` |
 | `confirm_token` | string | 危险设备时 | 危险设备二次确认令牌，机制同 `control_device` |
 
-返回：`{ok,entity_id,name,service,response_kind,status,expected_state,before,after,changed,verified,verification,message}`
+返回：`{ok, entity_id, name, service, response_kind, status, expected_state, before, after, changed, verified, verification, message}`。
+
 `status` 四态同 `control_device`：`confirmed` / `no_change` / `mismatch` / `accepted_pending`；`verification` 含 `attempts`、`elapsed_ms`、`checks`、`mismatches`。
 
-> 危险设备保护与 `control_device` 相同：`lock`/`alarm_control_panel` 及车库门/门窗类 `cover` 的首次调用只返回 `confirmation_required` 与 `confirm_token`，确认后带 token 重试才执行。
+> 危险设备保护与 `control_device` 相同：`lock` / `alarm_control_panel` 及车库门/门窗类 `cover` 的首次调用只返回 `confirmation_required` 与 `confirm_token`，确认后带 token 重试才执行。
 
-### 5.6 `list_domains` — 获取设备类型
+### 6.6 `list_domains` — 获取设备类型
 
-无参数。返回 `{ok,domains:{light:3,switch:2,...},controllable_domains:["light","switch",...],dangerous_domains:["lock",...],dangerous_entities:[{entity_id,name,domain,state,reason}],dangerous_entity_count,message}`。
-`dangerous_entities` 会识别 `lock`/`alarm_control_panel` 以及 `device_class=garage/door/gate/window` 的 cover，便于了解哪些具体实体操作需要二次确认。
+无参数。返回 `{ok, domains:{light:3,switch:2,...}, controllable_domains:["light","switch",...], dangerous_domains:["lock",...], dangerous_entities:[{entity_id,name,domain,state,reason}], dangerous_entity_count, message}`。
+
+`dangerous_entities` 会识别 `lock` / `alarm_control_panel` 以及 `device_class=garage/door/gate/window` 的 cover，便于了解哪些具体实体操作需要二次确认。
 
 ---
 
-## 6. 接入小智后端（xiaozhi-esp32-server）
+## 7. 接入小智后端
 
 小智后端的外部 MCP 接入有两条路径，本服务两者都支持。
 
 ### 方式 B（推荐）：服务端 MCP（ServerMCPManager）
 
-原理：xiaozhi-server 通过 `core/providers/tools/server_mcp` 读取 `data/.mcp_server_settings.json`，
-用标准 MCP 客户端（streamable-http / sse / stdio）直连本服务。
+原理：xiaozhi-server 通过 `core/providers/tools/server_mcp` 读取 `data/.mcp_server_settings.json`，用标准 MCP 客户端（streamable-http / sse / stdio）直连本服务。
 
 **步骤：**
 
-1. 让 `ha-mcp` 与 `xiaozhi-server` 处于**同一个 Docker 网络**（例如都写进 `deploy/docker-compose.yml`，或用 `docker network connect`）。
-   见 `integration/docker-compose.ha-mcp.fragment.yml`，追加到 `deploy/docker-compose.yml` 的 `services:` 下即可。
+1. 让 `homeassistant-xiaozhiserver` 与 `xiaozhi-server` 处于**同一个 Docker 网络**（例如都写进 `deploy/docker-compose.yml`，或用 `docker network connect`）。
+   见 `integration/docker-compose.homeassistant-xiaozhiserver.fragment.yml`，或直接使用已更新的 `deploy/docker-compose.yml`。
 2. 在宿主机 **`deploy/data/.mcp_server_settings.json`** 写入（该目录已挂载到容器 `/opt/xiaozhi-esp32-server/data`）：
 
 ```json
 {
   "mcpServers": {
     "ha": {
-      "url": "http://ha-mcp:8090/mcp",
+      "url": "http://homeassistant-xiaozhiserver:8090/mcp",
       "transport": "streamable-http",
       "timeout": 30,
       "sse_read_timeout": 300
@@ -275,9 +392,10 @@ python -m ha_mcp
 3. 重启 xiaozhi-server：
 
 ```bash
-cd deploy && docker compose restart xiaozhi-esp32-server
+cd deploy
+docker compose restart xiaozhi-esp32-server
 docker logs xiaozhi-esp32-server 2>&1 | grep -i "MCP"
-# 期望看到：初始化服务端MCP客户端: ha  ...  可用工具: ['list_devices','get_device_state','control_device','list_services','call_service','list_domains']
+# 期望看到：初始化服务端MCP客户端: ha ... 可用工具: [list_devices, get_device_state, control_device, list_services, call_service, list_domains]
 ```
 
 4. 之后用户在语音里提到的设备操作，会被 LLM 自动路由到上述工具。
@@ -287,7 +405,6 @@ docker logs xiaozhi-esp32-server 2>&1 | grep -i "MCP"
 适用于「MCP 接入点」集中管理（工具服务以 **stdio** 方式运行，再由 `mcp_pipe.py` 通过 WebSocket 连到接入点地址 `ws://<host>:8004/mcp_endpoint/mcp/?token=xxx`）：
 
 ```bash
-# 以 stdio 方式运行本服务
 export HA_URL=... HA_TOKEN=... MCP_TRANSPORT=stdio
 python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?token=xxx"
 ```
@@ -296,7 +413,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 
 ---
 
-## 7. 使用示例（自然语言 → 工具 → 参数 → 返回）
+## 8. 自然语言使用示例
 
 | 用户说 | 调用工具 | 参数 | 返回（节选） |
 |---|---|---|---|
@@ -304,7 +421,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | 列出所有的灯 | `list_devices` | `{"domain":"light"}` | `total=1, devices=[{"name":"客厅灯","state":"off"}]` |
 | 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=3` |
 | 哪些设备能控制？ | `list_devices` | `{"controllable_only":true}` | `total=6`（自动排除只读 sensor） |
-| 按物理设备看看家里有什么 | `list_devices` | `{"group_by":"device"}` | `devices=[{"name":"客厅环境组","entity_count":2,"controllable":true,"entities":[...]}] ` |
+| 按物理设备看看家里有什么 | `list_devices` | `{"group_by":"device"}` | `devices=[{"name":"客厅环境组","entity_count":2,"controllable":true,"entities":[...]}]` |
 | 家里有哪些类型的设备？ | `list_domains` | `{}` | `{"domains":{"light":1,"switch":1,...}}` |
 | 客厅灯现在开着吗？ | `get_device_state` | `{"entity":"客厅灯"}` | `{"ok":true,"entity":{"state":"off","attributes":{...}}}` |
 | 把客厅灯亮度调到 50% | `control_device` | `{"entity":"客厅灯","action":"set_brightness","value":50}` | `{"ok":true,"service":"light.turn_on","changed":true,"after":{"state":"on","brightness":127}}` |
@@ -335,9 +452,9 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 
 ---
 
-## 8. 错误处理与排查
+## 9. 错误处理与排查
 
-### 8.1 错误码
+### 9.1 错误码
 
 | code | 含义 | 处理建议 |
 |---|---|---|
@@ -347,7 +464,7 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | `timeout` | 请求 HA 超时 | 增大 `HA_TIMEOUT` 或检查网络/HA 负载 |
 | `upstream_error` | HA 5xx | 查看 HA 自身日志/健康状况 |
 | `http_error` | HA 返回非 2xx（401/403/404/5xx 之外） | 查看 HA 日志与请求参数 |
-| `network_error` | 连接/传输层错误（DNS、TLS、连接被重置等） | 检查网络、代理、TLS 证书与 `HA_URL` |
+| `network_error` | 连接/传输层错误（DNS、TLS、连接重置等） | 检查网络、代理、TLS 证书与 `HA_URL` |
 | `not_found` | 实体/资源不存在 | 用 `list_devices` 查正确 entity_id |
 | `not_controllable` | 设备类型无内置控制动作（如 sensor） | 只用 `get_device_state` 查询，或 `list_services` 后用 `call_service` |
 | `ambiguous` | 名称匹配到多个设备 | 改用更精确名称或 entity_id |
@@ -356,18 +473,20 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
 | `invalid_service` | `call_service` 的 service 为空/格式错 | 用 `list_services` 查服务名，格式 `service` 或 `domain.service` |
 | `invalid_data` | `data` 不是 JSON 对象、包含 `entity_id` 或字段值非法（如 `rgb_color` 分量越界） | 传键值对对象，如 `{"temperature":26}`；目标实体只用 `entity` 参数指定 |
 | `invalid_group_by` | `group_by` 取值不支持 | 使用 `entity`（默认）或 `device` |
-| `no_services` | 指定 domain 无可用服务 | 核对 domain 或用 `list_services` 不带过滤查看 |
+| `no_services` | 指定 domain 无可用服务 | 核对 domain 或 `list_services` 不带过滤查看 |
 | `confirmation_required` | 危险设备首次调用，未带 `confirm_token`（未执行） | 向用户确认后带返回的 `confirm_token` 重试 |
 | `invalid_confirm_token` | 令牌无效或已使用（一次性） | 重新发起原操作获取新令牌 |
 | `confirm_token_expired` | 令牌超过 `DANGER_CONFIRM_TTL` | 使用新返回的 `confirm_token`（已自动刷新） |
 | `confirm_token_mismatch` | 令牌与本次实体/服务/参数不匹配 | 重新发起原操作获取新令牌，勿改参数复用 |
+| `ws_error` / `registry_error` | HA WebSocket 注册表读取失败 | 一般会降级为按实体展示；检查 WS 权限/网络，或设 `HA_WS_ENABLED=false` |
+| `internal_error` | 未预期的内部错误 | 查看服务日志，确认 HA 版本与请求参数 |
 
-### 8.2 排查步骤
+### 9.2 排查步骤
 
-1. **看服务健康**：`curl http://127.0.0.1:8090/health`（liveness，仅表示 MCP 进程在运行）
-   和 `curl http://127.0.0.1:8090/ready`（readiness，HA 可达才 200）。
-   - `/ready` 返回 `"ha":"reachable"` 正常；`"ha":"error"` 时看 `ha_error` 的具体 code。
-2. **看日志**：`docker logs ha-mcp 2>&1 | tail -50`。
+1. **看服务健康**：
+   - `curl http://127.0.0.1:8090/health`：liveness，仅表示 MCP 进程在运行；
+   - `curl http://127.0.0.1:8090/ready`：readiness，HA 可达才 200。返回 `"ha":"reachable"` 正常；`"ha":"error"` 时看 `ha_error` 的具体 code。
+2. **看日志**：`docker logs homeassistant-xiaozhiserver 2>&1 | tail -50`。
 3. **单独验证 HA**（排除本服务问题）：
    ```bash
    curl -s -H "Authorization: Bearer <你的令牌>" https://your-ha.example:8123/api/states | head -c 300
@@ -379,28 +498,26 @@ python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?toke
    - Linux 下可加 `--add-host=host.docker.internal:host-gateway`。
 5. **TLS**：自签名证书导致 `SSLError` 时设 `HA_VERIFY_SSL=false`（仅受信网络）。
 6. **代理**：若宿主设置了 `HTTP_PROXY/NO_PROXY` 干扰直连，保持 `HA_TRUST_ENV=false`（默认）。
-7. **按设备聚合不可用**：`list_devices(group_by="device")` 依赖 HA WebSocket `config/device_registry/list`。
-   若返回 `registry_available:false`（令牌无权限、WS 被代理/防火墙拦截），会自动降级为按实体展示；
-   可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
-8. **控制回读不符（status=mismatch）**：说明 HA 接受了调用、状态也变了，但属性未达目标（如设备不支持该亮度/温度范围）。
-   核对 `list_services` 的字段与设备能力，必要时用 `get_device_state` 复查。
+7. **按设备聚合不可用**：`list_devices(group_by="device")` 依赖 HA WebSocket `config/device_registry/list`。若返回 `registry_available:false`（令牌无权限、WS 被代理/防火墙拦截），会自动降级为按实体展示；可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
+8. **控制回读不符（status=mismatch）**：说明 HA 接受了调用、状态也变了，但属性未达目标（如设备不支持该亮度/温度范围）。核对 `list_services` 的字段与设备能力，必要时用 `get_device_state` 复查。
 9. **危险设备一直返回 `confirmation_required`**：这是防误操作设计，不是故障。把首次返回的 `confirm_token` 原样传入再次调用即可；若令牌过期，用新返回的 token。需要临时关闭可设 `DANGER_CONFIRM_ENABLED=false`（不建议）。
 
-> 已知 HA 行为：对**不存在的实体**调用 service 也会返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
-> 本服务在 `control_device` / `call_service` 后执行**状态+属性回读校验**：`response_kind`(states/empty/none)、`status`(confirmed/no_change/mismatch/accepted_pending)、`verified` 与 `verification`(checks/mismatches)，避免误报成功。
+> 已知 HA 行为：对**不存在的实体**调用 service 也可能返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
+> 本服务在 `control_device` / `call_service` 后执行**状态+属性回读校验**：`response_kind`（states/empty/none）、`status`（confirmed/no_change/mismatch/accepted_pending）、`verified` 与 `verification`（checks/mismatches），避免误报成功。
 
 ---
 
-## 9. 离线测试（无需真实 HA）
+## 10. 离线测试
 
-提供模拟器与端到端脚本，可在没有 HA 的情况下验证全部工具。
-测试口令由你自己指定（模拟器与本服务共用同一个值，**不要用真实 HA 令牌**）。
+提供模拟器与端到端脚本，可在没有真实 HA 的情况下验证全部工具。测试口令由你自己指定（模拟器与本服务共用同一个值，**不要用真实 HA 令牌**）。
 
 ```bash
 # 一键运行（推荐）
 export TEST_TOKEN=任意本地测试口令
 bash tests/run_local_test.sh
 ```
+
+脚本会启动 fake HA（HTTP 8123 + WebSocket 8124）和本服务，等待 `/ready` 就绪后运行端到端断言，结束后自动清理进程。
 
 也可分三个终端手动运行：
 
@@ -412,32 +529,44 @@ python tests/fake_ha.py
 # 终端 2：启动本服务并指向模拟 HA（HA_TOKEN 与模拟器一致）
 export HA_URL=http://127.0.0.1:8123
 export HA_TOKEN=任意本地测试口令
-export HA_WS_URL=ws://127.0.0.1:8124/api/websocket   # 注册表 WS（fake_ha 默认 8124）
-python -m ha_mcp
+export HA_WS_URL=ws://127.0.0.1:8124/api/websocket
+python -m homeassistant_xiaozhiserver
 
 # 终端 3：用真实 MCP 客户端跑端到端用例
 python tests/e2e_mcp_client.py
 ```
 
-`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，并内置「延迟生效（*_delayed）」「只改状态不改属性（turn_on_ignore_brightness）」两种场景，用于验证回读确认与 mismatch 识别；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。P3 还内置 `lock.front_door`（大门门锁）与 `lock.lock`/`lock.unlock` 服务，端到端脚本会验证「首次 confirmation_required → 带 token 执行成功 → 复用/错误 token 被拒 → 意图不匹配被拒」全流程。
+`fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，并内置「延迟生效（*_delayed）」「只改状态不改属性（turn_on_ignore_brightness）」两种场景，用于验证回读确认与 mismatch 识别；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。P3 还内置 `lock.front_door`（大门门锁）与 `lock.lock` / `lock.unlock` 服务，端到端脚本会验证「首次 confirmation_required → 带 token 执行成功 → 复用/错误 token 被拒 → 意图不匹配被拒」全流程。
 
 ---
 
-## 10. 关于原需求中「(待补充)」项的处理
+## 11. 设备规模与性能
 
-- **传输方式 / 接入方式**：默认 `streamable-http`，并同时支持 `sse` 与 `stdio`；第 6 节给出
-  小智后端两条已验证接入路径（Path B 服务端 MCP 推荐；Path A MCP 接入点）。
-  若你的小智版本/入口不同，按第 6 节对应调整即可。
-- **设备较多时的返回规模**：`list_devices` 支持 `keyword`/`domain` 过滤 + `limit`/`offset` 分页
-  （默认 50、上限 500），避免实体过多撑爆上下文；返回含 `has_more`/`next_offset` 便于续拉。
-  另提供 `group_by="device"` 按物理设备聚合、`controllable_only=true` 只看可控设备，进一步压缩结果。
-- 其余未提供的信息未做假设；如需与特定小智版本/回调协议对接，请补充说明。
+- `list_devices` 支持 `keyword` / `domain` 过滤 + `limit` / `offset` 分页（默认 50、上限 500），返回 `has_more` / `next_offset` 便于续拉，避免实体过多撑爆上下文；
+- `group_by="device"` 按物理设备聚合，`controllable_only=true` 只看可控设备，进一步压缩结果；
+- `get_device_state` 默认只返回关键属性（亮度、色温、音量、温度、位置、电池等），完整属性需显式传 `include_all_attributes=true`；
+- `list_services` 指定 entity/domain 时返回字段明细，未指定时默认只返回服务名，便于按需展开。
 
 ---
 
-## 11. 安全建议
+## 12. 安全建议
 
-- `HA_TOKEN` 仅环境变量注入，不写入镜像/代码；`.env` 不要提交到 Git（建议加入 `.gitignore`）。
+- `HA_TOKEN` 仅环境变量注入，不写入镜像/代码；`.env` 不要提交到 Git（已加入 `.gitignore`）。
 - 容器以非 root 用户（uid 10001）运行。
 - 建议仅在受信内网暴露 `8090`；如需公网访问，请前置反向代理并加鉴权/TLS。
 - 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。
+- 建议为 HA 使用专用长期令牌，并仅授予必要的设备控制权限。
+
+---
+
+## 13. 版本记录
+
+| 版本 | 主要变化 |
+|---|---|
+| v1.6.0 | 项目、Python 包、Docker 服务/镜像/容器统一更名为 `homeassistant-xiaozhiserver`；README 全面重写；部署 compose、工具说明与错误处理文档完善 |
+| v1.5.0 | 拆分为独立 Python 包；配置集中解析；`/health` 与 `/ready` 分离；属性裁剪；注册表失败短重试；危险 cover 识别；测试断言与清理 |
+| v1.4.0 | 危险设备二次确认（一次性令牌防误操作） |
+| v1.3.0 | 控制后状态 + 属性四态回读校验（confirmed/no_change/mismatch/accepted_pending） |
+| v1.2.0 | 可控标记、危险标记、按物理设备聚合（WebSocket 注册表，优雅降级） |
+| v1.1.0 | 新增 `list_services` 服务自描述与通用 `call_service`；控制三态反馈 |
+| v1.0.0 | 初始版本：设备列表、状态查询、常用控制与 Docker 部署 |

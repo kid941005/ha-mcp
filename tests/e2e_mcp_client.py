@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """端到端自测：通过真实 MCP 客户端（streamable-http）连接本服务并调用全部工具。
 
-前置：先启动 fake_ha.py 与 python -m ha_mcp（见 tests/run_local_test.sh 或 README）。
+前置：先启动 fake_ha.py 与 python -m homeassistant_xiaozhiserver（见 tests/run_local_test.sh 或 README）。
 环境变量：MCP_URL 默认 http://127.0.0.1:8090/mcp
 
 本脚本对关键结果做断言；任一用例失败会以非 0 退出，便于 CI/回归。

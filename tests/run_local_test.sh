@@ -34,7 +34,7 @@ trap cleanup EXIT INT TERM
 
 "$PY" tests/fake_ha.py & FAKE=$!
 sleep 1.5
-"$PY" -m ha_mcp & SRV=$!
+"$PY" -m homeassistant_xiaozhiserver & SRV=$!
 
 # 等待 MCP/ready 就绪（HA 可达），而不是固定 sleep（最多 15s）
 READY=0

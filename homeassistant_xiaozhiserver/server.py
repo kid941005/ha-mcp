@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""小智 MCP 服务（Home Assistant 桥）。
+"""homeassistant-xiaozhiserver — 小智 MCP 服务（Home Assistant 桥）。
 
 把 Home Assistant 的设备能力封装成标准 MCP 工具，供小智（xiaozhi-esp32-server）
 或其他 MCP 客户端调用。默认以 streamable-http 暴露在 /mcp，也支持 sse / stdio。
@@ -49,7 +49,7 @@ from .views import (
 )
 
 mcp = FastMCP(
-    "ha-mcp",
+    "homeassistant-xiaozhiserver",
     instructions=(
         "把 Home Assistant 的智能家居设备封装为 MCP 工具。"
         "查看设备用 list_devices（可按 keyword 名称关键字或 domain 设备类型过滤，支持分页；"
@@ -509,7 +509,7 @@ async def _health(request):
     from starlette.responses import JSONResponse
     return JSONResponse({
         "status": "ok",
-        "service": "ha-mcp",
+        "service": "homeassistant-xiaozhiserver",
         "transport": os.environ.get("MCP_TRANSPORT", "streamable-http"),
     })
 
@@ -519,7 +519,7 @@ async def _ready(request):
     from starlette.responses import JSONResponse
     info: dict = {
         "status": "ok",
-        "service": "ha-mcp",
+        "service": "homeassistant-xiaozhiserver",
         "transport": os.environ.get("MCP_TRANSPORT", "streamable-http"),
     }
     code = 200

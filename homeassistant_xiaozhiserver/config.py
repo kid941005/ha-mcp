@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import os
 
-log = logging.getLogger("ha-mcp.config")
+log = logging.getLogger("homeassistant-xiaozhiserver.config")
 
 _TRUE = ("1", "true", "yes", "on", "y")
 
