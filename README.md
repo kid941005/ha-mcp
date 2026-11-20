@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.10.1** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.11.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -162,7 +162,7 @@ cp .env.example .env
 
 ### 5.2 Docker Compose（推荐）
 
-`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.10.1`，无需本地构建：
+`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.0`，无需本地构建：
 
 ```bash
 docker compose pull
@@ -210,7 +210,7 @@ python -m homeassistant_xiaozhiserver
     build:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.10.1
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.0
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:
@@ -241,15 +241,19 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `keyword` | string | 否 | 名称、entity_id 或所属设备名关键字，模糊匹配（如「客厅」「灯」） |
+| `keyword` | string | 否 | 名称、entity_id 或所属设备名关键字，模糊匹配（如「客厅」「灯」）；也可用等价别名 `query` / `q` / `search` / `name`（只传一个，传不同值会报 `invalid_argument`） |
 | `domain` | string | 否 | 设备类型过滤：`light` / `switch` / `sensor` / `climate` / `cover` / `media_player` / `fan` / `vacuum` / `scene` 等 |
 | `area` | string | 否 | 区域过滤：区域名称或 `area_id`，模糊匹配（如「客厅」「living_room」）；依赖 HA 区域注册表返回 `area_name`，按 `area_id` 过滤始终可用 |
-| `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体） |
+| `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体）；**不传且无其他过滤条件时默认 true** |
 | `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合） |
-| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`，上限 `MAX_LIST_LIMIT` |
+| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`、上限 `MAX_LIST_LIMIT`；**无过滤条件时默认 20** |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
 > `keyword`、`domain`、`area` 可任意组合，例如 `{"area":"客厅","domain":"light"}` 只返回客厅的灯。
+>
+> **默认收敛**：不传任何过滤条件时，默认只返回可控制设备且每页 20 条（响应里 `applied_defaults` 标示），避免一次把上百个实体塞给模型；需要全量时显式传 `controllable_only=false` 并配合 `limit`/`offset`。
+>
+> **未知参数不再静默忽略**：传入本工具不支持的参数会返回 `{"ok":false,"code":"invalid_argument","message":"不支持的参数：...；可用参数：..."}`，避免参数名写错却拿到全量数据。
 
 返回（entity 模式）：`{ok, grouped_by:"entity", registry_available, area, total, count, offset, limit, has_more, next_offset, devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,area_name}], message}`。
 
@@ -451,6 +455,14 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 
 工具清单以智控台握手结果为准；本服务固定暴露 6 个工具。
 
+**推荐在智控台的角色提示词里加一句硬约束**，可显著减少多余调用：
+
+```
+当用户明确点名某个设备要开/关时，直接调用 control_device(entity="设备中文名", action="turn_on"|"turn_off")，不要先调用 list_devices。
+```
+
+`list_devices` 的工具描述里已内置同样的约束；若智控台只能改系统提示词，把上面这句放进去即可。
+
 ### 7.7 注意事项
 
 - **只运行一个 bridge 实例**：同一 `MCP_ENDPOINT` 被多个 bridge 同时连接会产生重复工具/重复会话；需要高可用时应在 `mcp-endpoint-server` 侧做互斥或分片。
@@ -466,7 +478,8 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 
 | 用户说 | 调用工具 | 参数 | 返回（节选） |
 |---|---|---|---|
-| 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":7,"count":7,"has_more":false,"devices":[...]}` |
+| 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":6,"count":6,"has_more":false,"applied_defaults":{"controllable_only":true,"limit":20},"devices":[...]}`（默认只列可控设备） |
+| 列出所有实体（含传感器） | `list_devices` | `{"controllable_only":false}` | `total=7` |
 | 列出所有的灯 | `list_devices` | `{"domain":"light"}` | `total=1, devices=[{"name":"客厅灯","state":"off"}]` |
 | 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=3` |
 | 客厅区域有哪些设备？ | `list_devices` | `{"area":"客厅"}` | `total=6`（区域匹配，含 light/switch 等） |
@@ -602,7 +615,8 @@ python tests/e2e_mcp_client.py
 
 ## 11. 设备规模与性能
 
-- `list_devices` 支持 `keyword` / `domain` / `area` 过滤 + `limit` / `offset` 分页（默认 50、上限 500），返回 `has_more` / `next_offset` 便于续拉，避免实体过多撑爆上下文；
+- `list_devices` 支持 `keyword`（别名 `query`/`q`/`search`/`name`）/ `domain` / `area` 过滤 + `limit` / `offset` 分页（默认 50、上限 500），返回 `has_more` / `next_offset` 便于续拉，避免实体过多撑爆上下文；
+- 无过滤条件时 `list_devices` 默认 `controllable_only=true` 且每页 20 条（`applied_defaults` 标示），避免把上百个实体一次性塞给模型；未知参数返回 `invalid_argument` 而非静默忽略；
 - `group_by="device"` 按物理设备聚合，`controllable_only=true` 只看可控设备，进一步压缩结果；
 - `get_device_state` 默认只返回关键属性（亮度、色温、音量、温度、位置、电池等），完整属性需显式传 `include_all_attributes=true`；
 - `list_services` 指定 entity/domain 时返回字段明细，未指定时默认只返回服务名，便于按需展开。
@@ -624,6 +638,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.11.0 | `list_devices` 易用性与防误用：支持 `query`/`q`/`search`/`name` 关键字别名；未知参数返回 `invalid_argument` 并列出可用参数（不再静默忽略）；无过滤条件时默认 `controllable_only=true` 且每页 20 条；工具描述内置「点名设备直接 control_device」硬约束 |
 | v1.10.1 | 全项目冗余审计与清理：补齐 README 第 9 章标题、清理 xiaozhi-server 旧「方式 B」MCP 配置（`deploy/data/.mcp_server_settings.json` 置空）、更新 `deploy/.env` 服务名并补充 `MCP_ENDPOINT` 说明；代码层确认已无 HTTP/SSE/uvicorn/端口残留 |
 | v1.10.0 | 仅保留方式 A：移除 HTTP / SSE / streamable-http、8090 端口、`/health` / `/ready`、uvicorn 与方式 B 配置；`Dockerfile` 统一为 stdio bridge 镜像；`mcp_pipe.py` 只支持 stdio 子进程；测试改为 stdio 客户端；compose 不再暴露端口 |
 | v1.9.1 | 全面审计修复：`HA_VERIFY_SSL` 非法值回退默认、`HA_URL` 启动校验、WebSocket 注册表按 `result.id` 收集、回读失败标记 `accepted_pending` 并返回 `readback_errors`、分页/布尔参数健壮性、危险确认令牌容量上限、补齐 `resume` 动作与区域名回退 |

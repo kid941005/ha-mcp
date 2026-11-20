@@ -128,7 +128,8 @@ async def main():
 
         cases = [
             # 列表 / 过滤 / 分页 / 聚合
-            ("list_devices", {}, {"ok": True, "total": 7, "count": 7,
+            # 无过滤条件：默认只返回可控制设备且每页 20 条（7 个实体中 6 个可控）
+            ("list_devices", {}, {"ok": True, "total": 6, "count": 6,
                                    "grouped_by": "entity"}),
             ("list_devices", {"domain": "light"}, {"ok": True, "total": 1}),
             ("list_devices", {"keyword": "客厅"}, {"ok": True, "total": 3}),
@@ -143,8 +144,18 @@ async def main():
              {"ok": True, "total": 1, "first_domain": "switch"}),
             ("list_devices", {"area": "不存在"}, {"ok": True, "total": 0}),
             ("list_devices", {"controllable_only": True}, {"ok": True, "total": 6}),
-            ("list_devices", {"limit": 0}, {"ok": True, "total": 7, "count": 7}),
-            ("list_devices", {"offset": -3}, {"ok": True, "total": 7, "count": 7}),
+            ("list_devices", {"controllable_only": False}, {"ok": True, "total": 7, "count": 7}),
+            ("list_devices", {"limit": 0}, {"ok": True, "total": 6, "count": 6}),
+            ("list_devices", {"offset": -3}, {"ok": True, "total": 6, "count": 6}),
+            # 关键字别名 query/q/search/name 等价于 keyword
+            ("list_devices", {"query": "客厅"}, {"ok": True, "total": 3}),
+            ("list_devices", {"q": "客厅"}, {"ok": True, "total": 3}),
+            ("list_devices", {"search": "客厅"}, {"ok": True, "total": 3}),
+            ("list_devices", {"name": "客厅"}, {"ok": True, "total": 3}),
+            # 未知参数 / 冲突别名必须显式报错，而不是静默忽略
+            ("list_devices", {"bogus": 1}, {"ok": False, "code": "invalid_argument"}),
+            ("list_devices", {"query": "客厅", "keyword": "灯"},
+             {"ok": False, "code": "invalid_argument"}),
             ("list_devices", {"group_by": "device"}, {"ok": True, "total": 6,
                                                        "grouped_by": "device"}),
             ("list_devices", {"keyword": "客厅", "group_by": "device"},

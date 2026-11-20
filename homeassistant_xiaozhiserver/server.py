@@ -122,6 +122,55 @@ def _parse_pagination(limit: Any, offset: Any) -> Optional[tuple[int, int]]:
         return None
 
 
+def _accept_extra_arguments(tool_name: str) -> bool:
+    """让指定工具能收到未声明的参数，以便显式报错而不是被 MCP SDK 静默丢弃。
+
+    MCP SDK 默认按函数签名生成参数模型并忽略多余键，导致 model 传错参数名时
+    悄悄拿到全量数据。这里把该工具的校验模型换成允许额外字段的版本，
+    由工具函数自己检查 **extra 并返回 invalid_argument。
+    """
+    try:
+        from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase
+        from pydantic import ConfigDict, create_model
+    except Exception:  # noqa: BLE001 mcp 内部 API 变动时优雅降级
+        log.warning("无法为 %s 启用未知参数校验（mcp 内部 API 不可用）", tool_name)
+        return False
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        log.warning("无法为 %s 启用未知参数校验（工具未注册）", tool_name)
+        return False
+    base_model = tool.fn_metadata.arg_model
+    # **extra 会被 SDK 当成必填字段，发布前要剔除；extra="allow" 仍能接住多余参数
+    field_defs = {name: (fi.annotation, fi) for name, fi in base_model.model_fields.items()
+                  if name != "extra"}
+
+    class _ArgsWithExtra(ArgModelBase):
+        model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+        def model_dump_one_level(self) -> dict:
+            data = super().model_dump_one_level()
+            extra = self.__pydantic_extra__
+            if extra:
+                data.update(extra)
+            return data
+
+    tool.fn_metadata.arg_model = create_model(
+        base_model.__name__ + "WithExtra", __base__=_ArgsWithExtra, **field_defs
+    )
+    params = dict(tool.parameters)
+    properties = dict(params.get("properties") or {})
+    properties.pop("extra", None)
+    params["properties"] = properties
+    if "required" in params:
+        required = [n for n in params["required"] if n != "extra"]
+        if required:
+            params["required"] = required
+        else:
+            params.pop("required", None)
+    tool.parameters = params
+    return True
+
+
 def _safe_url(raw: str) -> str:
     """日志脱敏：去掉 URL 中的 userinfo、query 与 fragment。"""
     try:
@@ -182,31 +231,79 @@ def _log_tool(name: str):
 
 @mcp.tool()
 @_log_tool("list_devices")
-async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = None,
-                       area: Optional[str] = None,
-                       controllable_only: bool = False, group_by: str = "entity",
-                       limit: Optional[int] = None, offset: int = 0) -> dict:
+async def list_devices(
+    keyword: Optional[str] = None,
+    query: Optional[str] = None,
+    q: Optional[str] = None,
+    search: Optional[str] = None,
+    name: Optional[str] = None,
+    domain: Optional[str] = None,
+    area: Optional[str] = None,
+    controllable_only: Optional[bool] = None,
+    group_by: str = "entity",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    **extra: Any,
+) -> dict:
     """列出/查询 Home Assistant 中的设备。
 
-    可按 keyword（设备名称或 entity_id 关键字，模糊匹配）、domain（设备类型，
-    如 light/switch/sensor/climate/cover/media_player/fan/vacuum/scene）和 area
-    （区域名称或 area_id，模糊匹配，如「客厅」「living_room」）过滤，多个条件
-    同时生效（如 area="客厅", domain="light" 只返回客厅的灯）；
-    controllable_only=true 只返回可控制的设备；group_by="device" 时按物理设备聚合
-    （一个设备下的多个实体合并为一项，含 manufacturer/model/area 与 entities 列表）；
-    结果支持分页：limit 每页条数，offset 起始偏移（默认从 0 开始）。
+    keyword 按设备名称、entity_id 或设备名模糊匹配；也可使用等价别名
+    query / q / search / name（只能选一个，传入不同值会报 invalid_argument）。
+    domain 指定设备类型（light/switch/sensor/climate/cover/media_player/fan/
+    vacuum/scene）；area 指定区域名称或 area_id（如「客厅」「living_room」）。
+    多个条件同时生效（如 area="客厅", domain="light" 只返回客厅的灯）。
+    group_by="device" 时按物理设备聚合（一个设备下多个实体合并为一项，含
+    manufacturer/model/area 与 entities 列表）。
+    结果支持分页：limit 每页条数，offset 起始偏移（默认 0）。
+    未传任何过滤条件（keyword/domain/area）时，为控制返回体积默认只返回可控制
+    设备且每页 20 条；可用 controllable_only=false、limit 显式覆盖。
+    传入本工具不支持的参数会返回 invalid_argument 并列出可用参数。
 
     每个实体带 controllable（是否可控制）、actions（内置动作）、
     device_id/device_name/area_id/area_name。
+
+    重要：当用户明确点名某个设备要开/关时（如「打开客厅灯」「关一下风扇」），
+    直接调用 control_device(entity="客厅灯", action="turn_on")，不要先调用
+    list_devices 再控制。
+
     适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」「哪些设备能控制」。
     """
+    known_args = ("keyword", "query", "q", "search", "name", "domain", "area",
+                  "controllable_only", "group_by", "limit", "offset")
+    if extra:
+        unknown = "、".join(sorted(str(k) for k in extra))
+        return {"ok": False, "code": "invalid_argument",
+                "message": "不支持的参数：" + unknown + "。可用参数：" + "、".join(known_args) + "。"}
+
+    aliases = [("keyword", keyword), ("query", query), ("q", q),
+               ("search", search), ("name", name)]
+    provided = [(k, v.strip()) for k, v in aliases if isinstance(v, str) and v.strip()]
+    distinct = {v for _, v in provided}
+    if len(distinct) > 1:
+        detail = "、".join(k + "=" + v for k, v in provided)
+        return {"ok": False, "code": "invalid_argument",
+                "message": "关键字参数只能提供一个（keyword/query/q/search/name），"
+                           "但收到不同取值：" + detail + "。"}
+    keyword = provided[0][1] if provided else None
+
+    has_filter = bool(keyword or domain or area)
+    applied_defaults: dict = {}
+    if controllable_only is None:
+        controllable_only = not has_filter
+        if not has_filter:
+            applied_defaults["controllable_only"] = True
+    else:
+        controllable_only = _as_bool(controllable_only)
+    if limit is None and not has_filter:
+        limit = 20
+        applied_defaults["limit"] = 20
+
     try:
         page_args = _parse_pagination(limit, offset)
         if page_args is None:
             return {"ok": False, "code": "invalid_pagination",
                     "message": "limit/offset 必须是整数：limit 为正整数，offset 为非负整数。"}
         lim, off = page_args
-        controllable_only = _as_bool(controllable_only)
         ha = get_ha()
         states = await ha.get_states()
         try:
@@ -257,18 +354,28 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
         else:
             msg = "共 " + str(total) + " 个实体，本次返回 " + str(len(page)) + " 个"
         msg += "（还有更多，可用 offset=" + str(next_off) + " 继续）" if has_more else "。"
+        if applied_defaults:
+            note = "未指定过滤条件，默认仅返回可控制设备"
+            if "limit" in applied_defaults:
+                note += "、每页 20 条"
+            msg = note + "（可用 controllable_only=false 或 limit 覆盖）。" + msg
         return {
             "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
             "area": (area.strip() if area else None),
             "total": total, "count": len(page), "offset": off,
             "limit": lim, "has_more": has_more,
             "next_offset": next_off if has_more else None,
+            "applied_defaults": applied_defaults or None,
             "devices": page, "message": msg,
         }
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": _hint()}
     except Exception as e:  # noqa: BLE001 保证不崩溃
         return {"ok": False, "code": "internal_error", "message": "查询设备列表失败：" + str(e)}
+
+
+# 让 list_devices 显式拒绝未知参数（否则会被 MCP SDK 静默忽略）
+_accept_extra_arguments("list_devices")
 
 
 @mcp.tool()
