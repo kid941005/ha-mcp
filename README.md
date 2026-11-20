@@ -92,7 +92,7 @@ homeassistant-xiaozhiserver/
 ├── mcp_pipe.py                      # 小智 MCP 接入点桥接（WebSocket ↔ stdio）
 ├── requirements.txt
 ├── Dockerfile                       # bridge 镜像（stdio MCP server + mcp_pipe）
-├── docker-compose.yml               # 独立构建运行（无端口）
+├── docker-compose.yml               # 独立运行（默认 GHCR 镜像，无端口）
 ├── .env.example
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器
@@ -162,10 +162,15 @@ cp .env.example .env
 
 ### 5.2 Docker Compose（推荐）
 
+`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.10.1`，无需本地构建：
+
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
+
+需要自己改代码构建时，把 `docker-compose.yml` 里的 `image:` 注释掉、启用其下的 `build:` 两行，再执行 `docker compose up -d --build`。
 
 看到以下日志即表示桥接成功：
 
@@ -205,7 +210,7 @@ python -m homeassistant_xiaozhiserver
     build:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile
-    image: homeassistant-xiaozhiserver-bridge:latest
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.10.1
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:
@@ -409,7 +414,8 @@ MCP_PIPE - 已启动 MCP server：.../python .../server.py
 cd homeassistant-xiaozhiserver
 cp .env.example .env
 # 填写 MCP_ENDPOINT / HA_URL / HA_TOKEN
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
 
