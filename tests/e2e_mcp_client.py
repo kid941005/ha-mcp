@@ -130,6 +130,8 @@ async def main():
              {"ok": True, "total": 1, "first_domain": "switch"}),
             ("list_devices", {"area": "不存在"}, {"ok": True, "total": 0}),
             ("list_devices", {"controllable_only": True}, {"ok": True, "total": 6}),
+            ("list_devices", {"limit": 0}, {"ok": True, "total": 7, "count": 7}),
+            ("list_devices", {"offset": -3}, {"ok": True, "total": 7, "count": 7}),
             ("list_devices", {"group_by": "device"}, {"ok": True, "total": 6,
                                                        "grouped_by": "device"}),
             ("list_devices", {"keyword": "客厅", "group_by": "device"},
@@ -166,6 +168,8 @@ async def main():
              {"ok": True, "service": "cover.stop_cover"}),
             ("control_device", {"entity": "电视", "action": "set_volume", "value": 30},
              {"ok": True, "after_volume": 0.3}),
+            ("control_device", {"entity": "电视", "action": "resume"},
+             {"ok": True, "status": "confirmed", "after_state": "playing"}),
             # 边界与错误
             ("control_device", {"entity": "sensor.living_temp", "action": "turn_on"},
              {"ok": False, "code": "not_controllable"}),

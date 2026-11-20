@@ -21,7 +21,7 @@ from .client import HAError, HAClient
 log = logging.getLogger("homeassistant_xiaozhiserver.service")
 
 SUPPORTED_ACTIONS = [
-    "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "play",
+    "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "resume", "play",
     "set_brightness", "set_volume", "volume_mute", "volume_unmute",
     "set_temperature", "set_color_temp", "set_color", "lock", "unlock",
 ]
@@ -36,9 +36,9 @@ DOMAIN_ACTIONS = {
     "automation": ["turn_on", "turn_off", "toggle"],
     "cover": ["open", "close", "stop", "turn_on", "turn_off"],
     "climate": ["turn_on", "turn_off", "set_temperature"],
-    "media_player": ["turn_on", "turn_off", "play", "pause", "stop", "continue",
+    "media_player": ["turn_on", "turn_off", "play", "pause", "stop", "continue", "resume",
                      "set_volume", "volume_mute", "volume_unmute"],
-    "vacuum": ["turn_on", "turn_off", "stop", "pause", "continue"],
+    "vacuum": ["turn_on", "turn_off", "stop", "pause", "continue", "resume"],
     "lock": ["lock", "unlock"],
     "scene": ["turn_on"],
     "script": ["turn_on"],
@@ -120,7 +120,8 @@ def _expected_state(service: str, before_state: Optional[str],
 
 def _field_brief(fname: str, fdef: dict) -> dict:
     """把 HA 服务参数字段压缩成便于大模型理解的说明。"""
-    fdef = fdef or {}
+    if not isinstance(fdef, dict):
+        return {"name": fname, "required": False}
     sel = fdef.get("selector") or {}
     sel_type = next(iter(sel.keys()), None) if isinstance(sel, dict) else None
     out = {"name": fname, "required": bool(fdef.get("required"))}
@@ -256,6 +257,7 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
     attempts = 0
     after = None
     changed = False
+    readback_errors: list = []
     check = {"verified": False, "checks": [], "mismatches": []}
 
     while True:
@@ -267,8 +269,11 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         attempts += 1
         try:
             after_st = await ha.get_state(eid)
-        except HAError:
+        except HAError as e:
             after_st = None
+            # 服务已下发，回读失败不应伪造成“无变化”；记录错误供调用方判断。
+            if e.code not in readback_errors:
+                readback_errors.append(e.code)
         after = snapshot(after_st)
         changed = after is not None and after != before
         check = _check_after(after, expected, attr_expect)
@@ -286,6 +291,9 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
     elif changed:
         # 无明确预期时只能确认「有变化」，不能判为 mismatch
         status = "mismatch" if has_expectation else "confirmed"
+    elif readback_errors and after is None:
+        # 服务已下发但一次都没回读到状态：不能当作 no_change，标记为待确认。
+        status = "accepted_pending"
     elif resp_kind in ("empty", "states"):
         status = "no_change"
     else:  # none
@@ -313,10 +321,13 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         else:
             msg += "。注意：HA 已接受调用，但回读未见状态变化——设备可能不支持该操作或当前已是目标状态。"
     else:  # accepted_pending
-        msg += "。HA 未返回调用结果（新版 HA 常见），已下发但回读 " + str(attempts) + " 次仍未完全匹配预期"
-        if expected:
-            msg += "（预期状态：" + expected + "）"
-        msg += "；若稍后仍未变化，可用 get_device_state 复查。"
+        if readback_errors and after is None:
+            msg += "。HA 已接受调用，但回读状态失败（" + "、".join(readback_errors) + "），无法确认结果；请稍后用 get_device_state 复查。"
+        else:
+            msg += "。HA 未返回调用结果（新版 HA 常见），已下发但回读 " + str(attempts) + " 次仍未完全匹配预期"
+            if expected:
+                msg += "（预期状态：" + expected + "）"
+            msg += "；若稍后仍未变化，可用 get_device_state 复查。"
 
     verification = {
         "verified": verified,
@@ -325,6 +336,7 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         "expectations": {"state": expected, "attributes": attr_expect},
         "checks": check["checks"],
         "mismatches": check["mismatches"],
+        "readback_errors": readback_errors,
     }
     log.info("action entity=%s service=%s status=%s verified=%s attempts=%s elapsed_ms=%s",
              eid, svc_str, status, verified, attempts, verification["elapsed_ms"])
@@ -335,6 +347,7 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         "response_kind": resp_kind, "status": status,
         "expected_state": expected, "before": before, "after": after,
         "changed": changed, "verified": verified,
+        "readback_errors": readback_errors,
         "verification": verification, "message": msg,
     }
 
@@ -347,7 +360,7 @@ def _need_value(action: str, value: Any) -> None:
 def _clamp_pct(value: Any) -> int:
     try:
         v = float(value)
-    except Exception:
+    except (TypeError, ValueError):
         raise HAError("invalid_value", "value 必须是 1-100 的数字，收到：" + str(value))
     if v < 1 or v > 100:
         raise HAError("invalid_value", "value 必须在 1-100 之间，收到：" + str(value))
@@ -442,13 +455,13 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
         _need_value(a, value)
         try:
             return "climate", "set_temperature", {"temperature": float(value)}
-        except Exception:
+        except (TypeError, ValueError):
             raise HAError("invalid_value", "温度 value 必须是数字，收到：" + str(value))
     if a == "set_color_temp":
         _need_value(a, value)
         try:
             return "light", "turn_on", {"color_temp_kelvin": int(float(value))}
-        except Exception:
+        except (TypeError, ValueError):
             raise HAError("invalid_value", "色温 value 必须是开尔文数字，收到：" + str(value))
     if a == "set_color":
         _need_value(a, value)

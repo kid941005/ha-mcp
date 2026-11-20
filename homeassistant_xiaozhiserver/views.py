@@ -99,13 +99,16 @@ def _group_by_device(views: list, devices: dict, areas: Optional[dict] = None) -
         if g is None:
             d = devices.get(did) if did else None
             area_id = (d.get("area_id") if d else None) or v.get("area_id")
+            area_name = (areas or {}).get(area_id) if area_id else None
+            if not area_name:
+                area_name = v.get("area_name")
             g = {
                 "device_id": did,
                 "name": _device_label(d) if d else v.get("name"),
                 "manufacturer": (d.get("manufacturer") if d else None),
                 "model": (d.get("model") if d else None),
                 "area_id": area_id,
-                "area_name": (areas or {}).get(area_id) if area_id else v.get("area_name"),
+                "area_name": area_name,
                 "controllable": False,
                 "dangerous": False,
                 "entity_count": 0,

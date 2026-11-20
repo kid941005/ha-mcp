@@ -20,6 +20,7 @@ import os
 import time
 import uuid
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from mcp.server.mcpserver import MCPServer
 
@@ -96,6 +97,63 @@ def _short(value: Any, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """兼容直接 Python 调用传入字符串的布尔值，避免 "false" 被当成 True。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on", "y"):
+            return True
+        if v in ("0", "false", "no", "off", "n", ""):
+            return False
+    return bool(value)
+
+
+def _parse_pagination(limit: Any, offset: Any) -> Optional[tuple[int, int]]:
+    """把 limit/offset 归一化为合法分页；非法输入返回 None，由调用方返回结构化错误。"""
+    try:
+        if limit is None or (isinstance(limit, str) and not limit.strip()):
+            lim = DEFAULT_LIST_LIMIT
+        else:
+            lim = int(limit)
+            if lim <= 0:
+                lim = DEFAULT_LIST_LIMIT
+        lim = min(lim, MAX_LIST_LIMIT)
+        if offset is None or (isinstance(offset, str) and not offset.strip()):
+            off = 0
+        else:
+            off = int(offset)
+        return lim, max(0, off)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_url(raw: str) -> str:
+    """日志脱敏：去掉 URL 中的 userinfo、query 与 fragment。"""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return "(invalid)"
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _validate_http_path(name: str, value: str) -> str:
+    path = (value or "").strip()
+    if not path.startswith("/"):
+        raise SystemExit("无效的 " + name + "=" + repr(value) + "；HTTP 路径必须以 / 开头")
+    if path in ("/health", "/ready"):
+        raise SystemExit("无效的 " + name + "=" + repr(value) + "；不能与内置健康检查路径冲突")
+    if "?" in path or "#" in path:
+        raise SystemExit("无效的 " + name + "=" + repr(value) + "；HTTP 路径不能包含 ? 或 #")
+    return path
+
+
 def _safe_log_args(args: tuple, kwargs: dict) -> dict:
     out: dict = {}
     for i, v in enumerate(args):
@@ -163,6 +221,12 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
     适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」「哪些设备能控制」。
     """
     try:
+        page_args = _parse_pagination(limit, offset)
+        if page_args is None:
+            return {"ok": False, "code": "invalid_pagination",
+                    "message": "limit/offset 必须是整数：limit 为正整数，offset 为非负整数。"}
+        lim, off = page_args
+        controllable_only = _as_bool(controllable_only)
         ha = get_ha()
         states = await ha.get_states()
         try:
@@ -204,9 +268,6 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
                     "message": "group_by 仅支持 entity 或 device，收到：" + str(group_by) + "。entity 按实体逐条返回，device 按物理设备聚合。"}
 
         total = len(items)
-        lim = limit if (limit and int(limit) > 0) else DEFAULT_LIST_LIMIT
-        lim = min(int(lim), MAX_LIST_LIMIT)
-        off = max(0, int(offset or 0))
         page = items[off:off + lim]
         next_off = off + len(page)
         has_more = next_off < total
@@ -214,7 +275,7 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
             ent_total = sum(int(g.get("entity_count") or 0) for g in items)
             msg = "共 " + str(total) + " 个设备（聚合 " + str(ent_total) + " 个实体），本次返回 " + str(len(page)) + " 个"
         else:
-            msg = "共 " + str(total) + " 个设备，本次返回 " + str(len(page)) + " 个"
+            msg = "共 " + str(total) + " 个实体，本次返回 " + str(len(page)) + " 个"
         msg += "（还有更多，可用 offset=" + str(next_off) + " 继续）" if has_more else "。"
         return {
             "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
@@ -243,6 +304,7 @@ async def get_device_state(entity: str, include_all_attributes: bool = False) ->
     适用场景：用户问「客厅灯现在开着吗」「卧室温度多少」「空调什么状态」。
     """
     try:
+        include_all_attributes = _as_bool(include_all_attributes)
         ha = get_ha()
         st, cands = await ha.resolve_entity(entity)
         if st is None:
@@ -294,7 +356,7 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
       action  动作，支持：
         turn_on/turn_off   开关（cover 自动映射 open/close，vacuum 映射 start/stop）
         toggle             切换
-        open/close/stop/pause/continue/play  按设备能力映射到对应服务
+        open/close/stop/pause/continue/resume/play  按设备能力映射到对应服务
         lock/unlock        上锁 / 解锁（仅 lock）
         set_brightness     value=亮度百分比 1-100（仅 light）
         set_volume         value=音量百分比 1-100（media_player）
@@ -395,12 +457,13 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
             target = domain.strip().lower()
 
         kw = (keyword or "").strip().lower()
-        detailed = bool(detailed) or bool(target)
+        detailed = _as_bool(detailed) or bool(target)
 
-        def match(svc_name: str, svc_def: dict) -> bool:
+        def match(svc_name: str, svc_def: Any) -> bool:
             if not kw:
                 return True
-            svc_def = svc_def or {}
+            if not isinstance(svc_def, dict):
+                svc_def = {}
             text = (svc_name + " " + str(svc_def.get("description", "")) + " " +
                     str(svc_def.get("name", ""))).lower()
             return kw in text
@@ -408,12 +471,14 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
         domains_out = []
         service_total = 0
         for entry in catalog:
-            d = str((entry or {}).get("domain", ""))
+            if not isinstance(entry, dict):
+                continue
+            d = str(entry.get("domain", ""))
             if not d:
                 continue
             if target and d != target:
                 continue
-            services = (entry or {}).get("services") or {}
+            services = entry.get("services") or {}
             if not isinstance(services, dict):
                 continue
             svc_list = []
@@ -621,14 +686,18 @@ def main() -> None:
         raise SystemExit(
             "无效的 MCP_TRANSPORT=" + repr(transport) + "；允许的值为：" + ", ".join(allowed)
         )
+    mcp_path, sse_path = MCP_PATH, MCP_SSE_PATH
+    if transport != "stdio":
+        mcp_path = _validate_http_path("MCP_PATH", MCP_PATH)
+        sse_path = _validate_http_path("MCP_SSE_PATH", MCP_SSE_PATH)
     setup_logging()
     log.info(
         "startup transport=%s host=%s port=%s path=%s sse_path=%s log_level=%s",
-        transport, MCP_HOST, MCP_PORT, MCP_PATH, MCP_SSE_PATH, LOG_LEVEL,
+        transport, MCP_HOST, MCP_PORT, mcp_path, sse_path, LOG_LEVEL,
     )
     log.info(
         "HA config url=%s token=%s timeout=%ss verify_ssl=%s ws_enabled=%s ws_url=%s",
-        os.environ.get("HA_URL", "(not set)"),
+        _safe_url(os.environ.get("HA_URL", "(not set)")),
         "set" if os.environ.get("HA_TOKEN") else "missing",
         os.environ.get("HA_TIMEOUT", "10"),
         os.environ.get("HA_VERIFY_SSL", "true"),
@@ -642,10 +711,10 @@ def main() -> None:
     from starlette.routing import Route
 
     if transport == "sse":
-        app = mcp.sse_app(sse_path=MCP_SSE_PATH, host=MCP_HOST)
+        app = mcp.sse_app(sse_path=sse_path, host=MCP_HOST)
     else:  # streamable-http
         app = mcp.streamable_http_app(
-            streamable_http_path=MCP_PATH,
+            streamable_http_path=mcp_path,
             stateless_http=MCP_STATELESS,
             host=MCP_HOST,
         )

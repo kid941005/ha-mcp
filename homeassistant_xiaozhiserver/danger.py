@@ -36,12 +36,19 @@ def _danger_info(entity_id: str, attributes: Optional[dict]) -> dict:
 
 
 _CONFIRM_TOKENS: dict = {}
+# 单用户场景下正常不会堆积；加硬上限防止异常循环不断申请令牌导致内存增长。
+_MAX_CONFIRM_TOKENS = 512
 
 
 def _prune_confirm_tokens() -> None:
     now = time.monotonic()
     for token in [k for k, v in _CONFIRM_TOKENS.items() if float(v.get("expires_at", 0)) <= now]:
         _CONFIRM_TOKENS.pop(token, None)
+    overflow = len(_CONFIRM_TOKENS) - _MAX_CONFIRM_TOKENS
+    if overflow > 0:
+        oldest = sorted(_CONFIRM_TOKENS, key=lambda k: float(_CONFIRM_TOKENS[k].get("expires_at", 0)))
+        for token in oldest[:overflow]:
+            _CONFIRM_TOKENS.pop(token, None)
 
 
 def _confirm_intent(service_domain: str, service: str, payload: dict) -> str:

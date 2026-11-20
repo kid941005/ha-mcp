@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.9.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
+当前版本：**v1.9.1** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
 
 ---
 
@@ -87,12 +87,15 @@ homeassistant-xiaozhiserver/
 │   └── server.py                    # MCP 工具定义、健康检查、进程入口
 ├── server.py                        # 兼容入口（等价于 python -m homeassistant_xiaozhiserver）
 ├── requirements.txt
-├── Dockerfile
+├── Dockerfile                       # 主服务镜像（HTTP/SSE）
+├── Dockerfile.bridge                # 方式 A：stdio ↔ WebSocket 桥接镜像
 ├── docker-compose.yml               # 独立构建运行
+├── mcp_pipe.py                      # 方式 A：stdio ↔ WebSocket 桥接进程
 ├── .env.example
 ├── integration/
 │   ├── .mcp_server_settings.json    # 小智后端「服务端 MCP」配置样例
-│   └── docker-compose.homeassistant-xiaozhiserver.fragment.yml
+│   ├── docker-compose.homeassistant-xiaozhiserver.fragment.yml
+│   └── docker-compose.mcp-bridge.fragment.yml  # 方式 A bridge overlay 片段
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器
 │   ├── e2e_mcp_client.py            # 端到端 MCP 客户端断言测试
@@ -288,7 +291,7 @@ docker compose ps homeassistant-xiaozhiserver
 |---|---|---|
 | `turn_on` / `turn_off` | 开关；cover 自动映射 `open_cover` / `close_cover`，vacuum 映射 `start` / `stop` | — |
 | `toggle` | 切换 | — |
-| `open` / `close` / `stop` / `pause` / `continue` / `play` | 按设备能力映射到对应服务 | — |
+| `open` / `close` / `stop` / `pause` / `continue` / `resume` / `play` | 按设备能力映射到对应服务（`resume` 为 `continue` 的别名） | — |
 | `lock` / `unlock` | 上锁 / 解锁（lock） | — |
 | `set_brightness` | 设置亮度（light） | 1-100 |
 | `set_volume` | 设置音量（media_player） | 1-100 |
@@ -305,12 +308,12 @@ docker compose ps homeassistant-xiaozhiserver
 | switch / fan / input_boolean / automation | turn_on, turn_off, toggle |
 | cover | open, close, stop, turn_on, turn_off |
 | climate | turn_on, turn_off, set_temperature |
-| media_player | turn_on, turn_off, play, pause, stop, continue, set_volume, volume_mute, volume_unmute |
-| vacuum | turn_on, turn_off, stop, pause, continue |
+| media_player | turn_on, turn_off, play, pause, stop, continue, resume, set_volume, volume_mute, volume_unmute |
+| vacuum | turn_on, turn_off, stop, pause, continue, resume |
 | lock | lock, unlock |
 | scene / script | turn_on |
 
-返回：`{ok, entity_id, name, action, service, response_kind, status, expected_state, before, after, changed, verified, verification, message}`。
+返回：`{ok, entity_id, name, action, service, response_kind, status, expected_state, before, after, changed, verified, readback_errors, verification, message}`。
 
 **控制后状态+属性回读校验**：服务调用后会在 `SERVICE_CONFIRM_TIMEOUT` 秒内轮询回读，既核对状态（如 turn_on→on），也核对属性（亮度、温度、音量、色温、颜色等）。`status` 为：
 
@@ -319,9 +322,9 @@ docker compose ps homeassistant-xiaozhiserver
 | `confirmed` | 回读确认状态/属性已达到预期，且确有变化 |
 | `no_change` | HA 已接受但无变化；`verified=true` 表示设备本来就是目标状态 |
 | `mismatch` | 回读看到变化，但状态或属性与预期不符（设备能力/参数问题） |
-| `accepted_pending` | HA 返回 null（新版 HA 常见），已下发但回读窗口内仍未完全匹配 |
+| `accepted_pending` | HA 返回 null（新版 HA 常见），或回读状态失败；已下发但回读窗口内无法确认结果，`readback_errors` 给出失败错误码 |
 
-`verification` 给出 `attempts`（回读次数）、`elapsed_ms`、`expectations`、`checks`、`mismatches`，便于判断是否真正生效，避免 HA「对不存在实体也返回 200」造成的静默假成功。
+`verification` 给出 `attempts`（回读次数）、`elapsed_ms`、`expectations`、`checks`、`mismatches`、`readback_errors`，便于判断是否真正生效，避免 HA「对不存在实体也返回 200」造成的静默假成功。
 
 > 若设备类型本身不可控制（如 `sensor`），返回 `code:"not_controllable"` 并说明原因，不会误发服务。
 
@@ -353,9 +356,9 @@ docker compose ps homeassistant-xiaozhiserver
 | `data` | object | 否 | 额外参数 JSON，如 `{"temperature":26}`、`{"hvac_mode":"heat"}`、`{"rgb_color":[255,0,0]}`；不要包含 `entity_id` |
 | `confirm_token` | string | 危险设备时 | 危险设备二次确认令牌，机制同 `control_device` |
 
-返回：`{ok, entity_id, name, service, response_kind, status, expected_state, before, after, changed, verified, verification, message}`。
+返回：`{ok, entity_id, name, service, response_kind, status, expected_state, before, after, changed, verified, readback_errors, verification, message}`。
 
-`status` 四态同 `control_device`：`confirmed` / `no_change` / `mismatch` / `accepted_pending`；`verification` 含 `attempts`、`elapsed_ms`、`checks`、`mismatches`。
+`status` 四态同 `control_device`：`confirmed` / `no_change` / `mismatch` / `accepted_pending`；`verification` 含 `attempts`、`elapsed_ms`、`checks`、`mismatches`、`readback_errors`。
 
 > 危险设备保护与 `control_device` 相同：`lock` / `alarm_control_panel` 及车库门/门窗类 `cover` 的首次调用只返回 `confirmation_required` 与 `confirm_token`，确认后带 token 重试才执行。
 
@@ -421,7 +424,8 @@ export HA_URL="https://your-ha.example:8123"                         # (待补�
 export HA_TOKEN="<HA 长期访问令牌>"                                  # (待补充：你的 HA 令牌)
 export MCP_TRANSPORT=stdio
 python mcp_pipe.py server.py
-# 成功日志：MCP接入点连接成功 / MCP接入点支持的工具数量: 6
+# 成功日志：Successfully connected to WebSocket server / MCP接入点连接成功
+# 随后出现 Started server process；工具清单以智控台刷新结果为准（本服务共 6 个工具）
 ```
 
 > 不要把 `MCP_ENDPOINT`、`HA_TOKEN` 写进代码或 Git；只放本机环境变量或 `deploy/.env`。
@@ -641,6 +645,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.9.1 | 全面审计修复：`HA_VERIFY_SSL` 非法值回退默认、`HA_URL` 启动校验、WebSocket 注册表按 `result.id` 收集、回读失败标记 `accepted_pending` 并返回 `readback_errors`、分页/布尔参数健壮性、危险确认令牌容量上限、补齐 `resume` 动作与区域名回退 |
 | v1.9.0 | 新增区域名称返回与区域过滤：`list_devices` 支持 `area`，实体/设备视图返回 `area_id`/`area_name`，可与 `domain`/`keyword` 组合（如 `area="客厅", domain="light"`）；区域注册表失败时仅降级 `area_name` |
 | v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；Dockerfile.bridge 改为从源码安装依赖；streamable-http 与 stdio 验证通过；新增带 `call_id` 的结构化日志、工具调用耗时/错误码/动作回读记录与敏感信息脱敏，便于快速排障 |
 | v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、`Dockerfile.bridge`、bridge compose overlay；README 补充方式 A 接入说明 |

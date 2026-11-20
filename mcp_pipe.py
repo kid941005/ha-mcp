@@ -69,6 +69,7 @@ async def connect_to_server(uri, target):
         logger.info(f"[{target}] Connecting to WebSocket server...")
         async with websockets.connect(uri) as websocket:
             logger.info(f"[{target}] Successfully connected to WebSocket server")
+            logger.info(f"[{target}] MCP接入点连接成功")
 
             # Start server process (built from CLI arg or config)
             cmd, env = build_server_command(target)
@@ -191,7 +192,8 @@ def build_server_command(target=None):
     If target is None, read from sys.argv[1].
     """
     if target is None:
-        assert len(sys.argv) >= 2, "missing server name or script path"
+        if len(sys.argv) < 2:
+            raise RuntimeError("missing server name or script path")
         target = sys.argv[1]
     cfg = load_config()
     servers = cfg.get("mcpServers", {}) if isinstance(cfg, dict) else {}

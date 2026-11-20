@@ -4,16 +4,18 @@
 设计目标：
 - 所有环境变量只在这里解析，避免 server.py / client.py 各自实现一套。
 - 非法数值不直接让进程在 import 阶段崩溃：记录 warning 并回退默认值/边界值。
-- 布尔值统一支持 1/true/yes/on/y；空字符串视为未设置。
+- 布尔值统一支持 1/true/yes/on/y 与 0/false/no/off/n；无法识别的值记录 warning 并回退默认值。
 """
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 log = logging.getLogger("homeassistant-xiaozhiserver.config")
 
 _TRUE = ("1", "true", "yes", "on", "y")
+_FALSE = ("0", "false", "no", "off", "n")
 
 
 def env_str(name: str, default: str) -> str:
@@ -27,7 +29,13 @@ def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
-    return raw.strip().lower() in _TRUE
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    log.warning("环境变量 %s=%r 不是布尔值，使用默认值 %s", name, raw, default)
+    return default
 
 
 def env_int(name: str, default: int, minimum: int | None = None,
@@ -58,6 +66,9 @@ def env_float(name: str, default: float, minimum: float | None = None,
         value = float(raw.strip())
     except (TypeError, ValueError):
         log.warning("环境变量 %s=%r 不是数字，使用默认值 %s", name, raw, default)
+        return default
+    if not math.isfinite(value):
+        log.warning("环境变量 %s=%r 不是有限数字，使用默认值 %s", name, raw, default)
         return default
     if minimum is not None and value < minimum:
         log.warning("环境变量 %s=%s 小于最小值 %s，按 %s 使用", name, value, minimum, minimum)

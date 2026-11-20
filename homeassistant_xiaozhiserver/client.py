@@ -15,6 +15,7 @@ import os
 import ssl
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -73,6 +74,12 @@ class HAClient:
             raise HAError(
                 "config_missing",
                 "缺少必需的环境变量：" + ", ".join(missing) + "。请在 .env 或 docker run -e 中配置后重启服务。",
+            )
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise HAError(
+                "config_invalid",
+                "HA_URL 必须以 http:// 或 https:// 开头并包含主机名，当前为：" + self.base_url,
             )
 
     # ---------------- 底层 HTTP ----------------
@@ -225,30 +232,38 @@ class HAClient:
                         raise HAError("auth_failed", "Home Assistant WebSocket 鉴权失败：请检查 HA_TOKEN 是否有效。")
                 elif hello.get("type") != "auth_ok":
                     raise HAError("ws_error", "Home Assistant WebSocket 握手异常：" + str(hello.get("type")))
-                cmds = [(1, "config/device_registry/list"), (2, "config/entity_registry/list"),
-                        (3, "config/area_registry/list")]
-                for cid, ctype in cmds:
+                cmds = [
+                    (1, "config/device_registry/list", "devices"),
+                    (2, "config/entity_registry/list", "entities"),
+                    (3, "config/area_registry/list", "areas"),
+                ]
+                pending = {cid: (ctype, key) for cid, ctype, key in cmds}
+                for cid, ctype, _ in cmds:
                     await ws.send(json.dumps({"id": cid, "type": ctype}))
                 out: dict = {"devices": [], "entities": [], "areas": []}
-                for _ in cmds:
-                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
-                    if msg.get("type") != "result":
+                # 按消息 id 收集结果：HA 可能穿插 event 或其它响应，不能按消息条数硬收。
+                deadline = time.monotonic() + max(self.timeout * 3, 5.0)
+                while pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=remaining))
+                    if not isinstance(msg, dict) or msg.get("type") != "result":
                         continue
+                    cid = msg.get("id")
+                    if cid not in pending:
+                        continue
+                    _, key = pending.pop(cid)
                     if not msg.get("success"):
                         err = msg.get("error") or {}
                         text = str(err.get("message") or err)
                         # 区域注册表属于增强信息，失败时只降级区域名，不影响设备/实体。
-                        if msg.get("id") == 3:
+                        if key == "areas":
                             log.warning("HA area registry unavailable: %s", text)
                             out["areas"] = []
                             continue
                         raise HAError("registry_error", "读取 Home Assistant 注册表失败：" + text)
-                    if msg.get("id") == 1:
-                        out["devices"] = msg.get("result") or []
-                    elif msg.get("id") == 2:
-                        out["entities"] = msg.get("result") or []
-                    elif msg.get("id") == 3:
-                        out["areas"] = msg.get("result") or []
+                    out[key] = msg.get("result") or []
                 return out
         except asyncio.TimeoutError as e:
             raise HAError("timeout", "连接 Home Assistant WebSocket 超时。", str(e)) from e
