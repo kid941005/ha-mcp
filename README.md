@@ -1,9 +1,9 @@
 # homeassistant-xiaozhiserver
 
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
-> 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言查询与控制，支持 Docker 一键部署。
+> 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.9.1** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
+当前版本：**v1.10.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -15,7 +15,7 @@
 4. [环境变量](#4-环境变量)
 5. [快速开始](#5-快速开始)
 6. [MCP 工具](#6-mcp-工具)
-7. [接入小智后端](#7-接入小智后端)
+7. [接入小智后端（MCP 接入点）](#7-接入小智后端mcp-接入点)
 8. [自然语言使用示例](#8-自然语言使用示例)
 9. [错误处理与排查](#9-错误处理与排查)
 10. [离线测试](#10-离线测试)
@@ -30,6 +30,7 @@
 | 能力 | 说明 |
 |---|---|
 | 六个 MCP 工具 | `list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains`，名称、描述与参数均面向自然语言路由设计 |
+| 小智 MCP 接入点 | 只保留 **stdio + WebSocket bridge** 一种接入方式：`mcp_pipe.py` 主动连接 `mcp-endpoint-server` 的工具端地址，无需公网暴露本服务端口 |
 | 设备发现与状态 | 支持按名称/entity_id 模糊查询，按 `domain`、`area` 过滤且条件可组合；状态查询默认裁剪为关键属性，避免上下文膨胀 |
 | 常用控制 | 开关、亮度、音量、温度、色温、颜色、窗帘、门锁等常用动作，按设备 domain 自动映射到对应 HA 服务 |
 | 能力自描述 | `list_services` 查询某类或某个设备支持哪些服务及参数字段，先看能力再调用 |
@@ -39,8 +40,8 @@
 | 可控与危险标记 | 每个实体带 `controllable`、`actions`、`dangerous`、`danger_reason`；`list_domains` 汇总危险实体 |
 | 按物理设备聚合 | `group_by="device"` 通过 HA WebSocket 注册表把同一设备的多个实体合并展示；注册表不可用时自动降级为按实体展示 |
 | 健壮错误处理 | 所有工具返回结构化 JSON；失败给 `code` / `message` / `hint`，不抛异常堆栈、不使服务崩溃 |
-| 配置安全 | `HA_URL` / `HA_TOKEN` 只从环境变量读取，不写入镜像或代码 |
-| 离线可测 | 自带 fake HA 模拟器与端到端测试，无需真实 Home Assistant 即可验证全部工具 |
+| 配置安全 | `HA_URL` / `HA_TOKEN` / `MCP_ENDPOINT` 只从环境变量读取，不写入镜像或代码 |
+| 离线可测 | 自带 fake HA 模拟器与 stdio 端到端测试，无需真实 Home Assistant 即可验证全部工具 |
 
 ---
 
@@ -49,23 +50,25 @@
 ```
 用户语音
   └─> 小智后端（ASR → LLM → function calling）
-        └─> MCP 客户端（ServerMCPManager，server_mcp 通道）
-              └─> 本服务  /mcp  (streamable-http)
-                    ├─> Home Assistant REST API
-                    │     ├─ GET  /api/states                 读取实体状态
-                    │     ├─ GET  /api/services               读取服务目录
-                    │     └─ POST /api/services/{domain}/{service}  执行控制
-                    └─> Home Assistant WebSocket API
-                          └─ /api/websocket（设备/实体注册表，用于按设备聚合）
-                                └─> 真实设备
+        └─> mcp-endpoint-server（MCP 接入点，工具端 WebSocket）
+              └─> mcp_pipe.py（WebSocket ↔ stdio 桥接，主动连出）
+                    └─> server.py（stdio MCP server）
+                          ├─> Home Assistant REST API
+                          │     ├─ GET  /api/states                 读取实体状态
+                          │     ├─ GET  /api/services               读取服务目录
+                          │     └─ POST /api/services/{domain}/{service}  执行控制
+                          └─> Home Assistant WebSocket API
+                                └─ /api/websocket（设备/实体注册表，用于按设备聚合）
+                                      └─> 真实设备
 ```
 
 一次典型调用：
 
-1. 小智后端启动时对本服务执行 `list_tools`，把工具定义并入 LLM 的 function 列表；
-2. 用户说话 → ASR 转文本 → LLM 选择工具与参数；
-3. 小智后端 `call_tool` → 本服务调用 HA REST/WS → 返回结构化结果；
-4. LLM 根据结果生成自然语言回复。
+1. 小智后端通过 MCP 接入点向桥接进程发送 `initialize` / `tools/list`，桥接进程转发给 stdio MCP server；
+2. 小智后端把 6 个工具定义并入 LLM 的 function 列表；
+3. 用户说话 → ASR 转文本 → LLM 选择工具与参数；
+4. 小智后端 `tools/call` → 桥接进程 → MCP server → HA REST/WS → 结构化结果原路返回；
+5. LLM 根据结果生成自然语言回复。
 
 > 本服务不持久化业务数据。设备/实体注册表是进程内 TTL 缓存，危险确认令牌也是单进程内存，因此默认按**单实例**部署；多副本场景需要额外共享令牌或改用签名令牌方案。
 
@@ -77,28 +80,23 @@
 homeassistant-xiaozhiserver/
 ├── homeassistant_xiaozhiserver/                          # Python 包（应用代码）
 │   ├── __init__.py
-│   ├── __main__.py                  # python -m homeassistant_xiaozhiserver 入口
+│   ├── __main__.py                  # python -m homeassistant_xiaozhiserver 入口（stdio）
 │   ├── config.py                    # 环境变量解析与运行常量（非法值告警并回退）
 │   ├── logging_setup.py             # 统一日志格式、call_id 单次调用追踪
 │   ├── client.py                    # HA REST/WebSocket 客户端、鉴权与错误归一化
 │   ├── service.py                   # 动作映射、状态/属性预期、回读校验
 │   ├── danger.py                    # 危险设备判定、一次性确认令牌
 │   ├── views.py                     # 实体摘要、可控标记、按设备聚合
-│   └── server.py                    # MCP 工具定义、健康检查、进程入口
+│   └── server.py                    # 六个 MCP 工具、stdio 进程入口
 ├── server.py                        # 兼容入口（等价于 python -m homeassistant_xiaozhiserver）
+├── mcp_pipe.py                      # 小智 MCP 接入点桥接（WebSocket ↔ stdio）
 ├── requirements.txt
-├── Dockerfile                       # 主服务镜像（HTTP/SSE）
-├── Dockerfile.bridge                # 方式 A：stdio ↔ WebSocket 桥接镜像
-├── docker-compose.yml               # 独立构建运行
-├── mcp_pipe.py                      # 方式 A：stdio ↔ WebSocket 桥接进程
+├── Dockerfile                       # bridge 镜像（stdio MCP server + mcp_pipe）
+├── docker-compose.yml               # 独立构建运行（无端口）
 ├── .env.example
-├── integration/
-│   ├── .mcp_server_settings.json    # 小智后端「服务端 MCP」配置样例
-│   ├── docker-compose.homeassistant-xiaozhiserver.fragment.yml
-│   └── docker-compose.mcp-bridge.fragment.yml  # 方式 A bridge overlay 片段
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器
-│   ├── e2e_mcp_client.py            # 端到端 MCP 客户端断言测试
+│   ├── e2e_mcp_client.py            # stdio 端到端 MCP 客户端断言测试
 │   └── run_local_test.sh
 └── README.md
 ```
@@ -113,7 +111,8 @@ homeassistant-xiaozhiserver/
 | `service.py` | 动作 → HA 服务映射；预期状态/属性推导；控制后四态回读校验 |
 | `danger.py` | 判断危险设备；签发/消费一次性 `confirm_token`，绑定实体、服务与参数 |
 | `views.py` | 实体视图、关键属性裁剪、可控性/危险标记、按物理设备聚合 |
-| `server.py` | 六个 MCP 工具；`/health` 与 `/ready`；传输方式与进程入口 |
+| `server.py` | 六个 MCP 工具；固定 `stdio` 传输；进程入口 |
+| `mcp_pipe.py` | 连接小智 MCP 接入点，启动 stdio MCP server，双向搬运 JSON-RPC，断线自动重连 |
 
 ---
 
@@ -121,14 +120,9 @@ homeassistant-xiaozhiserver/
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
+| `MCP_ENDPOINT` | ✅ | — | 小智 MCP 接入点的**工具端 WebSocket** 地址，形如 `ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>`；不是 `/mcp_endpoint/health?key=...` |
 | `HA_URL` | ✅ | — | Home Assistant 地址，如 `https://your-ha.example:8123`（结尾不要带 `/`） |
 | `HA_TOKEN` | ✅ | — | HA 长期访问令牌（个人资料 → 安全 → 长期访问令牌） |
-| `MCP_TRANSPORT` | | `streamable-http` | `streamable-http` / `sse` / `stdio`；其它值启动时报错退出 |
-| `MCP_HOST` | | `0.0.0.0` | 监听地址 |
-| `MCP_PORT` | | `8090` | 监听端口 |
-| `MCP_PATH` | | `/mcp` | streamable-http 路径 |
-| `MCP_SSE_PATH` | | `/sse` | sse 路径（仅 sse 传输时使用） |
-| `MCP_STATELESS` | | `false` | 是否使用无状态 HTTP 传输（仅传输层；多副本仍需共享危险确认令牌/注册表缓存） |
 | `HA_TIMEOUT` | | `10` | 访问 HA 的超时秒数 |
 | `HA_VERIFY_SSL` | | `true` | 是否校验 HA 的 TLS 证书（自签名证书设 `false`） |
 | `HA_TRUST_ENV` | | `false` | 是否读取宿主 HTTP(S)_PROXY/NO_PROXY；默认关闭，避免代理干扰直连 HA |
@@ -149,42 +143,38 @@ homeassistant-xiaozhiserver/
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
 
 > 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
-> 安全：`HA_TOKEN` 只通过环境变量注入，不写入镜像、代码或 Git。
+> 安全：`HA_TOKEN` / `MCP_ENDPOINT` 只通过环境变量注入，不写入镜像、代码或 Git。
 
 ---
 
 ## 5. 快速开始
 
-### 5.1 Docker Compose（推荐，使用 GHCR 镜像）
+### 5.1 准备 `.env`
 
 ```bash
 cd homeassistant-xiaozhiserver
 cp .env.example .env
-# 编辑 .env，填入 HA_URL 与 HA_TOKEN
-docker compose pull homeassistant-xiaozhiserver
-docker compose up -d homeassistant-xiaozhiserver
-docker compose logs -f
-curl -s http://127.0.0.1:8090/ready
+# 编辑 .env，至少填写：
+#   MCP_ENDPOINT=ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>
+#   HA_URL=https://your-ha.example:8123
+#   HA_TOKEN=你的HA长期访问令牌
 ```
 
-> 镜像来自 GHCR，无需本地构建；需要从源码构建时使用 5.2 的 `docker build`。
-
-`/ready` 返回 `{"status":"ok",...,"ha":"reachable"}` 表示 MCP 服务已启动且 HA 可达。
-
-### 5.2 docker build / run
+### 5.2 Docker Compose（推荐）
 
 ```bash
-docker build -t homeassistant-xiaozhiserver:latest .
-
-docker run -d --name homeassistant-xiaozhiserver \
-  -p 8090:8090 \
-  -e HA_URL=https://your-ha.example:8123 \
-  -e HA_TOKEN=你的HA长期访问令牌 \
-  --restart unless-stopped \
-  homeassistant-xiaozhiserver:latest
+docker compose up -d --build
+docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
 
-> HA 使用自签名证书时追加 `-e HA_VERIFY_SSL=false`。
+看到以下日志即表示桥接成功：
+
+```text
+MCP_PIPE - MCP接入点连接成功
+MCP_PIPE - 已启动 MCP server：...
+```
+
+> 本服务**不监听任何端口**，compose 中没有 `ports` / `expose` / `healthcheck`。判断存活看容器状态与日志，不要访问 8090。
 
 ### 5.3 本地开发（无 Docker）
 
@@ -192,54 +182,51 @@ docker run -d --name homeassistant-xiaozhiserver \
 python -m venv .venv
 . .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-export HA_URL=https://your-ha.example:8123
-export HA_TOKEN=你的HA长期访问令牌
+
+export MCP_ENDPOINT="ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>"
+export HA_URL="https://your-ha.example:8123"
+export HA_TOKEN="你的HA长期访问令牌"
+
+python mcp_pipe.py server.py
+```
+
+也可以直接运行 stdio server（仅用于本地调试，不经过小智接入点）：
+
+```bash
 python -m homeassistant_xiaozhiserver
 ```
 
-服务启动后：
-
-| 地址 | 用途 |
-|---|---|
-| `http://<host>:8090/mcp` | MCP streamable-http 端点 |
-| `http://<host>:8090/health` | liveness：仅表示 MCP 进程/HTTP 服务在运行，不依赖 HA |
-| `http://<host>:8090/ready` | readiness：HA 可达且鉴权通过才返回 200，否则 503 |
-
 ### 5.4 并入现有 deploy compose
 
-本项目实际部署目录为 `D:/dsh/esp32/deploy`。`deploy/docker-compose.yml` 已追加 `homeassistant-xiaozhiserver` 服务，镜像直接使用 GHCR 预构建镜像，关键配置如下：
+`deploy/docker-compose.yml` 已包含 bridge 服务，关键配置如下：
 
 ```yaml
-  homeassistant-xiaozhiserver:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
-    container_name: homeassistant-xiaozhiserver
+  homeassistant-xiaozhiserver-bridge:
+    build:
+      context: ../homeassistant-xiaozhiserver
+      dockerfile: Dockerfile
+    image: homeassistant-xiaozhiserver-bridge:latest
+    container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - TZ=Asia/Shanghai
-      - HA_URL=${HA_URL:?set HA_URL in deploy/.env}
-      - HA_TOKEN=${HA_TOKEN:?set HA_TOKEN in deploy/.env}
-    expose:
-      - "8090"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MCP_PORT','8090')+'/ready', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
 ```
 
-在 `deploy/.env` 中补充 `HA_URL` 与 `HA_TOKEN` 后执行：
+在 `deploy/.env` 中补充 `MCP_ENDPOINT` / `HA_URL` / `HA_TOKEN` 后执行：
 
 ```bash
 cd deploy
-docker compose pull homeassistant-xiaozhiserver
-docker compose up -d homeassistant-xiaozhiserver
-docker compose ps homeassistant-xiaozhiserver
+docker compose up -d --build homeassistant-xiaozhiserver-bridge
+docker compose ps homeassistant-xiaozhiserver-bridge
+docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
 
-`homeassistant-xiaozhiserver` 与 `xiaozhi-esp32-server` 同处默认网络，小智后端可以直接访问 `http://homeassistant-xiaozhiserver:8090/mcp`。
+> bridge 主动连出到 `MCP_ENDPOINT`，与 `xiaozhi-server` 不需要同网络，也不需要为它做端口映射。
 
 ---
+
 
 ## 6. MCP 工具
 
@@ -369,117 +356,104 @@ docker compose ps homeassistant-xiaozhiserver
 `dangerous_entities` 会识别 `lock` / `alarm_control_panel` 以及 `device_class=garage/door/gate/window` 的 cover，便于了解哪些具体实体操作需要二次确认。
 
 ---
+## 7. 接入小智后端（MCP 接入点）
 
-## 7. 接入小智后端
+本服务只支持一种接入方式：**小智 MCP 接入点（工具端 WebSocket）**。不再提供 HTTP / SSE / streamable-http 直连，也不需要在智控台填写 `http://<host>:8090/mcp`。
 
-小智后端的外部 MCP 接入有两条路径，本服务两者都支持。
+### 7.1 原理
 
-### 方式 B（推荐）：服务端 MCP（ServerMCPManager）
-
-原理：xiaozhi-server 通过 `core/providers/tools/server_mcp` 读取 `data/.mcp_server_settings.json`，用标准 MCP 客户端（streamable-http / sse / stdio）直连本服务。
-
-**步骤：**
-
-1. 让 `homeassistant-xiaozhiserver` 与 `xiaozhi-server` 处于**同一个 Docker 网络**（例如都写进 `deploy/docker-compose.yml`，或用 `docker network connect`）。
-   见 `integration/docker-compose.homeassistant-xiaozhiserver.fragment.yml`，或直接使用已更新的 `deploy/docker-compose.yml`。
-2. 在宿主机 **`deploy/data/.mcp_server_settings.json`** 写入（该目录已挂载到容器 `/opt/xiaozhi-esp32-server/data`）：
-
-```json
-{
-  "mcpServers": {
-    "ha": {
-      "url": "http://homeassistant-xiaozhiserver:8090/mcp",
-      "transport": "streamable-http",
-      "timeout": 30,
-      "sse_read_timeout": 300
-    }
-  }
-}
+```
+小智后端 ──> mcp-endpoint-server ──WebSocket──> mcp_pipe.py ──stdio──> server.py ──> Home Assistant
 ```
 
-> ⚠️ `transport` 必须显式写 `"streamable-http"`；不写时 xiaozhi 默认按 `sse` 连接，会失败。
+- `mcp_pipe.py` 是 WebSocket **客户端**，主动连接 `mcp-endpoint-server` 暴露的工具端地址；
+- 连接建立后，它用 `stdio` 启动 `server.py`，并在 WebSocket 文本消息与子进程 stdin/stdout 之间原样搬运 MCP JSON-RPC；
+- 因此 bridge 不需要监听端口，也不需要公网映射；只要它能出网访问 `MCP_ENDPOINT`，并且能访问 `HA_URL` 即可。
 
-3. 重启 xiaozhi-server：
+### 7.2 获取正确的工具端地址
 
-```bash
-cd deploy
-docker compose restart xiaozhi-esp32-server
-docker logs xiaozhi-esp32-server 2>&1 | grep -i "MCP"
-# 期望看到：初始化服务端MCP客户端: ha ... 可用工具: [list_devices, get_device_state, control_device, list_services, call_service, list_domains]
+在智控台「MCP 接入点」中复制**工具端地址**，形如：
+
+```text
+ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>
 ```
 
-4. 之后用户在语音里提到的设备操作，会被 LLM 自动路由到上述工具。
+> ⚠️ `http://<宿主>:8004/mcp_endpoint/health?key=<KEY>` 是智控台参数里的健康检查地址，**不是**工具连接地址。`mcp_pipe.py` 只接受 `ws://` 或 `wss://`。
 
-### 方式 A：MCP 接入点（mcp-endpoint-server）
-
-适用于「MCP 接入点」集中管理：本服务以 **stdio** 方式运行，由 `mcp_pipe.py` 通过 WebSocket 连接 `mcp-endpoint-server` 的工具端地址。`/mcp_endpoint/health?key=...` 只是智控台参数地址，不能作为工具连接地址。
-
-#### A1. 本机快速验证
+### 7.3 本机快速验证
 
 ```bash
-cd D:/dsh/esp32/homeassistant-xiaozhiserver
-python -m pip install -r requirements.txt python-dotenv
-export MCP_ENDPOINT="ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>"  # (待补充：接入点日志中的工具端地址)
-export HA_URL="https://your-ha.example:8123"                         # (待补充：你的 HA 地址)
-export HA_TOKEN="<HA 长期访问令牌>"                                  # (待补充：你的 HA 令牌)
-export MCP_TRANSPORT=stdio
+cd homeassistant-xiaozhiserver
+pip install -r requirements.txt
+
+export MCP_ENDPOINT="ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>"
+export HA_URL="https://your-ha.example:8123"
+export HA_TOKEN="你的HA长期访问令牌"
+
 python mcp_pipe.py server.py
-# 成功日志：Successfully connected to WebSocket server / MCP接入点连接成功
-# 随后出现 Started server process；工具清单以智控台刷新结果为准（本服务共 6 个工具）
 ```
 
-> 不要把 `MCP_ENDPOINT`、`HA_TOKEN` 写进代码或 Git；只放本机环境变量或 `deploy/.env`。
+成功日志特征：
 
-#### A2. Docker Compose 常驻
-
-项目内提供 `Dockerfile.bridge`，从源码安装 mcp 2.x 依赖并加入 `mcp_pipe.py`：
-
-```yaml
-services:
-  homeassistant-xiaozhiserver-bridge:
-    build:
-      context: ../homeassistant-xiaozhiserver
-      dockerfile: Dockerfile.bridge
-    image: homeassistant-xiaozhiserver-bridge:latest
-    container_name: homeassistant-xiaozhiserver-bridge
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      TZ: Asia/Shanghai
-      MCP_TRANSPORT: stdio
+```text
+MCP_PIPE - 正在连接 MCP 接入点 ws://<宿主>:8004/mcp_endpoint/mcp/
+MCP_PIPE - MCP接入点连接成功
+MCP_PIPE - 已启动 MCP server：.../python .../server.py
 ```
 
-也可直接使用 `integration/docker-compose.mcp-bridge.fragment.yml` 片段。
+日志里不会打印 token（query 已脱敏）。随后在智控台刷新 MCP 工具列表，应看到本服务的 6 个工具。
 
-在 `D:/dsh/esp32/deploy/.env` 增加（值用占位符，不要提交）：
-
-```dotenv
-MCP_ENDPOINT=ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>
-HA_URL=https://your-ha.example:8123
-HA_TOKEN=<HA 长期访问令牌>
-```
-
-启动与日志：
+### 7.4 Docker Compose 常驻
 
 ```bash
-cd D:/dsh/esp32/deploy
-docker compose -f docker-compose.yml -f docker-compose.mcp-bridge.yml up -d --build homeassistant-xiaozhiserver-bridge
-docker logs -f homeassistant-xiaozhiserver-bridge
+cd homeassistant-xiaozhiserver
+cp .env.example .env
+# 填写 MCP_ENDPOINT / HA_URL / HA_TOKEN
+docker compose up -d --build
+docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
 
-#### A3. 网络连通
+容器配置了 `restart: unless-stopped`；进程内部还有指数退避重连（1s 起，最大 600s），`mcp-endpoint-server` 重启或网络抖动后会自动恢复。
 
-- **同网络**：把 bridge 与 `mcp-endpoint-server` 放进同一个 Docker 网络，`MCP_ENDPOINT` 用服务名，例如 `ws://mcp-endpoint-server:8004/mcp_endpoint/mcp/?token=<TOKEN>`。
-- **不同网络**：`MCP_ENDPOINT` 用宿主机/目标机可达地址，例如 `ws://192.168.1.10:8004/mcp_endpoint/mcp/?token=<TOKEN>`；确保防火墙放行 **出站** 到该端口。本服务是主动连出，不需要为 `8090` 做公网映射。
+### 7.5 网络连通
 
-#### A4. 接入结果核对
+| 场景 | `MCP_ENDPOINT` 写法 |
+|---|---|
+| bridge 与 `mcp-endpoint-server` 在同一 compose 网络 | `ws://mcp-endpoint-server:8004/mcp_endpoint/mcp/?token=<TOKEN>` |
+| 两者在不同机器/网络 | `ws://<mcp-endpoint-server 可达地址>:8004/mcp_endpoint/mcp/?token=<TOKEN>`，或经反向代理使用 `wss://` |
+| `mcp-endpoint-server` 在公网 | `wss://<域名>/mcp_endpoint/mcp/?token=<TOKEN>`（建议 TLS） |
 
-智控台刷新 MCP 接入状态后，应看到 6 个工具：`list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains`。
+需要保证的只有两条：
 
-> 方式 B（`url: http://homeassistant-xiaozhiserver:8090/mcp`）与方式 A（stdio bridge）同时存在会导致工具重复暴露；二选一即可。当前若只用方式 A，可把方式 B 的 xiaozhi MCP settings 移除。
+1. bridge → `mcp-endpoint-server:8004` 可出网访问；
+2. bridge → `HA_URL` 可访问。
+
+不需要为 bridge 发布 8090，也不需要在路由器上做任何入站端口映射。
+
+### 7.6 智控台核对
+
+在智控台刷新 MCP 工具后，应看到：
+
+| 工具 | 用途 |
+|---|---|
+| `list_devices` | 查询设备列表 |
+| `get_device_state` | 查询单个设备状态 |
+| `control_device` | 常用控制 |
+| `list_services` | 查询设备支持的服务与参数 |
+| `call_service` | 通用服务调用 |
+| `list_domains` | 查询设备类型汇总 |
+
+工具清单以智控台握手结果为准；本服务固定暴露 6 个工具。
+
+### 7.7 注意事项
+
+- **只运行一个 bridge 实例**：同一 `MCP_ENDPOINT` 被多个 bridge 同时连接会产生重复工具/重复会话；需要高可用时应在 `mcp-endpoint-server` 侧做互斥或分片。
+- `MCP_ENDPOINT` 含 token，只放 `.env` 或运行时环境变量，不要提交到 Git、不要写进镜像。
+- 不要把 `/mcp_endpoint/health?key=...` 填进 `MCP_ENDPOINT`。
+- 断线重连会重新启动 `server.py`；危险确认令牌是进程内内存，重连后旧令牌失效，需要重新发起原操作。
 
 ---
+
 
 ## 8. 自然语言使用示例
 
@@ -521,9 +495,6 @@ docker logs -f homeassistant-xiaozhiserver-bridge
 ```
 
 ---
-
-## 9. 错误处理与排查
-
 ### 9.1 错误码
 
 | code | 含义 | 处理建议 |
@@ -550,48 +521,46 @@ docker logs -f homeassistant-xiaozhiserver-bridge
 | `confirm_token_mismatch` | 令牌与本次实体/服务/参数不匹配 | 重新发起原操作获取新令牌，勿改参数复用 |
 | `ws_error` / `registry_error` | HA WebSocket 注册表读取失败 | 一般会降级为按实体展示；检查 WS 权限/网络，或设 `HA_WS_ENABLED=false` |
 | `internal_error` | 未预期的内部错误 | 查看服务日志，确认 HA 版本与请求参数 |
-
 ### 9.2 排查步骤
 
-1. **看服务健康**：
-   - `curl http://127.0.0.1:8090/health`：liveness，仅表示 MCP 进程在运行；
-   - `curl http://127.0.0.1:8090/ready`：readiness，HA 可达才 200。返回 `"ha":"reachable"` 正常；`"ha":"error"` 时看 `ha_error` 的具体 code。
-2. **看日志（带 call_id 追踪）**：`docker logs -f homeassistant-xiaozhiserver`。
-   - 每条日志格式：`时间 级别 logger [call_id] 消息`；`call_id` 是单次工具调用的短 ID，可把同一次调用内的工具入口、HA 请求和动作回读串起来。
-   - 常用过滤：
-     ```bash
-     docker logs -f homeassistant-xiaozhiserver 2>&1 | grep -E 'tool=|action |HA registry|readiness failed'
-     docker logs homeassistant-xiaozhiserver 2>&1 | grep '<call_id>'
-     ```
-   - 关键日志示例：
-     - `tool=list_devices start args=...` / `tool=list_devices done ok=true elapsed_ms=...`
-     - `action entity=light.living_room service=light.turn_on status=confirmed verified=True attempts=1 elapsed_ms=...`
-     - `tool=control_device done ok=false code=not_found ...`（失败原因、错误码和耗时直接可见）
-   - `confirm_token` 在日志中显示为 `***`；`HA_TOKEN` 启动日志只显示 `set`/`missing`，不会打印值。
-   - 需要查看每次 HA 请求/响应时设 `LOG_LEVEL=DEBUG`（生产环境建议保持 `INFO`）。
-3. **单独验证 HA**（排除本服务问题）：
+1. **看 bridge 日志**：`docker logs -f homeassistant-xiaozhiserver-bridge`。
+   - 先确认出现 `MCP接入点连接成功` 与 `已启动 MCP server`；
+   - 若一直重连，检查 `MCP_ENDPOINT` 是否为工具端 `ws://` 地址、token 是否有效、bridge 能否访问该主机/端口。
+2. **看容器状态**：`docker compose ps`。容器应保持 `Up`；反复重启通常是 `MCP_ENDPOINT` 未设置或格式错误（进程会直接退出）。
+3. **看日志（带 call_id 追踪）**：每条日志格式为 `时间 级别 logger [call_id] 消息`，`call_id` 可把一次工具调用的入口、HA 请求与回读串起来。
+   ```bash
+   docker logs -f homeassistant-xiaozhiserver-bridge 2>&1 | grep -E 'tool=|action |HA registry|MCP接入点'
+   docker logs homeassistant-xiaozhiserver-bridge 2>&1 | grep '<call_id>'
+   ```
+   关键日志示例：
+   - `tool=list_devices start args=...` / `tool=list_devices done ok=true elapsed_ms=...`
+   - `action entity=light.living_room service=light.turn_on status=confirmed verified=True attempts=1 elapsed_ms=...`
+   - `tool=control_device done ok=false code=not_found ...`
+   - `confirm_token` 在日志中显示为 `***`；`HA_TOKEN` 启动日志只显示 `set`/`missing`。
+4. **单独验证 HA**（排除本服务问题）：
    ```bash
    curl -s -H "Authorization: Bearer <你的令牌>" https://your-ha.example:8123/api/states | head -c 300
    ```
-   - 401 → 令牌问题；连接被拒 → 地址/网络问题。
-4. **网络**：容器内访问 HA 注意
+   401 → 令牌问题；连接被拒 → 地址/网络问题。
+5. **网络**：bridge 容器内访问 HA 注意
    - 同一 compose 网络用服务名（如 `http://homeassistant:8123`）；
    - 访问宿主机上的 HA 用 `http://host.docker.internal:8123`（Docker Desktop）；
    - Linux 下可加 `--add-host=host.docker.internal:host-gateway`。
-5. **TLS**：自签名证书导致 `SSLError` 时设 `HA_VERIFY_SSL=false`（仅受信网络）。
-6. **代理**：若宿主设置了 `HTTP_PROXY/NO_PROXY` 干扰直连，保持 `HA_TRUST_ENV=false`（默认）。
-7. **按设备聚合不可用**：`list_devices(group_by="device")` 依赖 HA WebSocket `config/device_registry/list`。若返回 `registry_available:false`（令牌无权限、WS 被代理/防火墙拦截），会自动降级为按实体展示；可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
-8. **控制回读不符（status=mismatch）**：说明 HA 接受了调用、状态也变了，但属性未达目标（如设备不支持该亮度/温度范围）。核对 `list_services` 的字段与设备能力，必要时用 `get_device_state` 复查。
-9. **危险设备一直返回 `confirmation_required`**：这是防误操作设计，不是故障。把首次返回的 `confirm_token` 原样传入再次调用即可；若令牌过期，用新返回的 token。需要临时关闭可设 `DANGER_CONFIRM_ENABLED=false`（不建议）。
+6. **TLS**：自签名证书导致 `SSLError` 时设 `HA_VERIFY_SSL=false`（仅受信网络）。
+7. **代理**：若宿主设置了 `HTTP_PROXY/NO_PROXY` 干扰直连，保持 `HA_TRUST_ENV=false`（默认）。
+8. **按设备聚合不可用**：`list_devices(group_by="device")` 依赖 HA WebSocket `config/device_registry/list`。若返回 `registry_available:false`，会自动降级为按实体展示；可用 `HA_WS_URL` 指定地址，或设 `HA_WS_ENABLED=false` 明确关闭。
+9. **控制回读不符（status=mismatch）**：说明 HA 接受了调用、状态也变了，但属性未达目标（如设备不支持该亮度/温度范围）。核对 `list_services` 的字段与设备能力，必要时用 `get_device_state` 复查。
+10. **危险设备一直返回 `confirmation_required`**：这是防误操作设计，不是故障。把首次返回的 `confirm_token` 原样传入再次调用即可；若令牌过期，用新返回的 token。
 
 > 已知 HA 行为：对**不存在的实体**调用 service 也可能返回 HTTP 200（响应为空）；新版 HA 对多数服务调用返回 **null**。
 > 本服务在 `control_device` / `call_service` 后执行**状态+属性回读校验**：`response_kind`（states/empty/none）、`status`（confirmed/no_change/mismatch/accepted_pending）、`verified` 与 `verification`（checks/mismatches），避免误报成功。
 
 ---
 
+
 ## 10. 离线测试
 
-提供模拟器与端到端脚本，可在没有真实 HA 的情况下验证全部工具。测试口令由你自己指定（模拟器与本服务共用同一个值，**不要用真实 HA 令牌**）。
+提供模拟器与 stdio 端到端脚本，可在没有真实 HA 的情况下验证全部工具。测试口令由你自己指定（模拟器与本服务共用同一个值，**不要用真实 HA 令牌**）。
 
 ```bash
 # 一键运行（推荐）
@@ -599,28 +568,26 @@ export TEST_TOKEN=任意本地测试口令
 bash tests/run_local_test.sh
 ```
 
-脚本会启动 fake HA（HTTP 8123 + WebSocket 8124）和本服务，等待 `/ready` 就绪后运行端到端断言，结束后自动清理进程。
+脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。整个测试不需要 `/ready` 或 8090 端口。
 
-也可分三个终端手动运行：
+也可分两个终端手动运行：
 
 ```bash
 # 终端 1：启动模拟 HA（令牌取自 FAKE_HA_TOKEN，缺省 devtoken）
 export FAKE_HA_TOKEN=任意本地测试口令
 python tests/fake_ha.py
 
-# 终端 2：启动本服务并指向模拟 HA（HA_TOKEN 与模拟器一致）
+# 终端 2：e2e 客户端自己启动 stdio MCP server
 export HA_URL=http://127.0.0.1:8123
 export HA_TOKEN=任意本地测试口令
 export HA_WS_URL=ws://127.0.0.1:8124/api/websocket
-python -m homeassistant_xiaozhiserver
-
-# 终端 3：用真实 MCP 客户端跑端到端用例
 python tests/e2e_mcp_client.py
 ```
 
 `fake_ha.py` 特意复刻了「对不存在实体返回 200」的行为，并内置「延迟生效（*_delayed）」「只改状态不改属性（turn_on_ignore_brightness）」两种场景，用于验证回读确认与 mismatch 识别；并内置极简 WebSocket 注册表（默认 8124 端口）用于验证按设备聚合，未安装 websockets 时自动跳过。P3 还内置 `lock.front_door`（大门门锁）与 `lock.lock` / `lock.unlock` 服务，端到端脚本会验证「首次 confirmation_required → 带 token 执行成功 → 复用/错误 token 被拒 → 意图不匹配被拒」全流程。
 
 ---
+
 
 ## 11. 设备规模与性能
 
@@ -630,27 +597,29 @@ python tests/e2e_mcp_client.py
 - `list_services` 指定 entity/domain 时返回字段明细，未指定时默认只返回服务名，便于按需展开。
 
 ---
-
 ## 12. 安全建议
 
-- `HA_TOKEN` 仅环境变量注入，不写入镜像/代码；`.env` 不要提交到 Git（已加入 `.gitignore`）。
+- `HA_TOKEN` / `MCP_ENDPOINT` 仅环境变量注入，不写入镜像/代码；`.env` 不要提交到 Git（已加入 `.gitignore`）。
+- bridge 主动连出，**不需要对外暴露任何端口**；不要在路由器/防火墙上为它做入站映射。
 - 容器以非 root 用户（uid 10001）运行。
-- 建议仅在受信内网暴露 `8090`；如需公网访问，请前置反向代理并加鉴权/TLS。
 - 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，并仅授予必要的设备控制权限。
+- 若 `mcp-endpoint-server` 在公网，使用 `wss://` 并确保 token 不泄露；`mcp_pipe.py` 日志已对 query 脱敏。
 
 ---
+
 
 ## 13. 版本记录
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.10.0 | 仅保留方式 A：移除 HTTP / SSE / streamable-http、8090 端口、`/health` / `/ready`、uvicorn 与方式 B 配置；`Dockerfile` 统一为 stdio bridge 镜像；`mcp_pipe.py` 只支持 stdio 子进程；测试改为 stdio 客户端；compose 不再暴露端口 |
 | v1.9.1 | 全面审计修复：`HA_VERIFY_SSL` 非法值回退默认、`HA_URL` 启动校验、WebSocket 注册表按 `result.id` 收集、回读失败标记 `accepted_pending` 并返回 `readback_errors`、分页/布尔参数健壮性、危险确认令牌容量上限、补齐 `resume` 动作与区域名回退 |
 | v1.9.0 | 新增区域名称返回与区域过滤：`list_devices` 支持 `area`，实体/设备视图返回 `area_id`/`area_name`，可与 `domain`/`keyword` 组合（如 `area="客厅", domain="light"`）；区域注册表失败时仅降级 `area_name` |
-| v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；Dockerfile.bridge 改为从源码安装依赖；streamable-http 与 stdio 验证通过；新增带 `call_id` 的结构化日志、工具调用耗时/错误码/动作回读记录与敏感信息脱敏，便于快速排障 |
-| v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、`Dockerfile.bridge`、bridge compose overlay；README 补充方式 A 接入说明 |
+| v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；新增带 `call_id` 的结构化日志、工具调用耗时/错误码/动作回读记录与敏感信息脱敏，便于快速排障 |
+| v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、bridge 镜像与 compose；README 补充方式 A 接入说明 |
 | v1.6.0 | 项目、Python 包、Docker 服务/镜像/容器统一更名为 `homeassistant-xiaozhiserver`；README 全面重写；部署 compose、工具说明与错误处理文档完善 |
-| v1.5.0 | 拆分为独立 Python 包；配置集中解析；`/health` 与 `/ready` 分离；属性裁剪；注册表失败短重试；危险 cover 识别；测试断言与清理 |
+| v1.5.0 | 拆分为独立 Python 包；配置集中解析；属性裁剪；注册表失败短重试；危险 cover 识别；测试断言与清理 |
 | v1.4.0 | 危险设备二次确认（一次性令牌防误操作） |
 | v1.3.0 | 控制后状态 + 属性四态回读校验（confirmed/no_change/mismatch/accepted_pending） |
 | v1.2.0 | 可控标记、危险标记、按物理设备聚合（WebSocket 注册表，优雅降级） |

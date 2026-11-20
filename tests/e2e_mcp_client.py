@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""端到端自测：通过真实 MCP 客户端（streamable-http）连接本服务并调用全部工具。
+"""端到端自测：通过真实 MCP 客户端以 stdio 启动本服务并调用全部工具。
 
-前置：先启动 fake_ha.py 与 python -m homeassistant_xiaozhiserver（见 tests/run_local_test.sh 或 README）。
-环境变量：MCP_URL 默认 http://127.0.0.1:8090/mcp
+前置：先启动 fake_ha.py（见 tests/run_local_test.sh 或 README）。
+本脚本会以子进程方式启动 server.py，环境变量 HA_URL / HA_TOKEN / HA_WS_URL 由外部提供。
 
 本脚本对关键结果做断言；任一用例失败会以非 0 退出，便于 CI/回归。
 """
@@ -11,10 +11,12 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
-from mcp import Client
+from mcp import Client, StdioServerParameters
 
-MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:8090/mcp")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SERVER_SCRIPT = PROJECT_ROOT / "server.py"
 EXPECTED_TOOLS = {
     "list_devices", "get_device_state", "control_device",
     "list_services", "call_service", "list_domains",
@@ -106,8 +108,19 @@ def verify_case(index, name, args, r, expected):
               (d.get("entity") or {}).get("attributes_truncated"))
 
 
+def _server_params():
+    env = os.environ.copy()
+    # 子进程通过 server.py 启动；显式 cwd 保证包导入与 .env 行为稳定
+    return StdioServerParameters(
+        command=sys.executable,
+        args=[str(SERVER_SCRIPT)],
+        env=env,
+        cwd=str(PROJECT_ROOT),
+    )
+
+
 async def main():
-    async with Client(MCP_URL) as session:
+    async with Client(_server_params()) as session:
         tools = await session.list_tools()
         names = [t.name for t in tools.tools]
         print("TOOLS:", names)

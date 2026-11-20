@@ -2,7 +2,7 @@
 """homeassistant-xiaozhiserver — 小智 MCP 服务（Home Assistant 桥）。
 
 把 Home Assistant 的设备能力封装成标准 MCP 工具，供小智（xiaozhi-esp32-server）
-或其他 MCP 客户端调用。默认以 streamable-http 暴露在 /mcp，也支持 sse / stdio。
+通过 MCP 接入点调用。本进程固定以 stdio 运行，由 mcp_pipe.py 桥接 WebSocket。
 
 模块划分：
   config.py    环境变量解析与运行常量（非法值回退并告警）
@@ -10,7 +10,7 @@
   service.py   动作映射、状态/属性预期、回读校验
   danger.py    危险设备判定与一次性确认令牌
   views.py     实体摘要、可控性标记、按设备聚合
-  server.py    MCP 工具定义、健康检查与进程入口
+  server.py    MCP 工具定义与 stdio 进程入口
 """
 from __future__ import annotations
 
@@ -24,16 +24,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from mcp.server.mcpserver import MCPServer
 
-from .config import (
-    DEFAULT_LIST_LIMIT,
-    LOG_LEVEL,
-    MAX_LIST_LIMIT,
-    MCP_HOST,
-    MCP_PATH,
-    MCP_PORT,
-    MCP_SSE_PATH,
-    MCP_STATELESS,
-)
+from .config import DEFAULT_LIST_LIMIT, LOG_LEVEL, MAX_LIST_LIMIT
 from .client import HAError, HAClient
 from .danger import _danger_block, _danger_flags
 from .service import (
@@ -141,17 +132,6 @@ def _safe_url(raw: str) -> str:
         return raw
     netloc = parsed.netloc.rsplit("@", 1)[-1]
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-
-
-def _validate_http_path(name: str, value: str) -> str:
-    path = (value or "").strip()
-    if not path.startswith("/"):
-        raise SystemExit("无效的 " + name + "=" + repr(value) + "；HTTP 路径必须以 / 开头")
-    if path in ("/health", "/ready"):
-        raise SystemExit("无效的 " + name + "=" + repr(value) + "；不能与内置健康检查路径冲突")
-    if "?" in path or "#" in path:
-        raise SystemExit("无效的 " + name + "=" + repr(value) + "；HTTP 路径不能包含 ? 或 #")
-    return path
 
 
 def _safe_log_args(args: tuple, kwargs: dict) -> dict:
@@ -646,55 +626,9 @@ async def list_domains() -> dict:
         return {"ok": False, "code": "internal_error", "message": "查询设备类型失败：" + str(e)}
 
 
-async def _health(request):
-    """liveness：只表示 MCP 进程/HTTP 服务在运行，不依赖 HA。"""
-    from starlette.responses import JSONResponse
-    return JSONResponse({
-        "status": "ok",
-        "service": "homeassistant-xiaozhiserver",
-        "transport": os.environ.get("MCP_TRANSPORT", "streamable-http"),
-    })
-
-
-async def _ready(request):
-    """readiness：HA 可达且鉴权通过才返回 200，否则 503。"""
-    from starlette.responses import JSONResponse
-    info: dict = {
-        "status": "ok",
-        "service": "homeassistant-xiaozhiserver",
-        "transport": os.environ.get("MCP_TRANSPORT", "streamable-http"),
-    }
-    code = 200
-    try:
-        await get_ha().ping()
-        info["ha"] = "reachable"
-    except HAError as e:
-        code = 503
-        info.update({"status": "error", "ha": "error", "ha_error": e.to_dict()})
-        log.warning("readiness failed: %s", e.to_dict())
-    except Exception as e:  # noqa: BLE001
-        code = 503
-        info.update({"status": "error", "ha": "error", "ha_error": str(e)})
-        log.warning("readiness failed: %s", e)
-    return JSONResponse(info, status_code=code)
-
-
 def main() -> None:
-    transport = os.environ.get("MCP_TRANSPORT", "streamable-http").strip().lower()
-    allowed = ("streamable-http", "sse", "stdio")
-    if transport not in allowed:
-        raise SystemExit(
-            "无效的 MCP_TRANSPORT=" + repr(transport) + "；允许的值为：" + ", ".join(allowed)
-        )
-    mcp_path, sse_path = MCP_PATH, MCP_SSE_PATH
-    if transport != "stdio":
-        mcp_path = _validate_http_path("MCP_PATH", MCP_PATH)
-        sse_path = _validate_http_path("MCP_SSE_PATH", MCP_SSE_PATH)
     setup_logging()
-    log.info(
-        "startup transport=%s host=%s port=%s path=%s sse_path=%s log_level=%s",
-        transport, MCP_HOST, MCP_PORT, mcp_path, sse_path, LOG_LEVEL,
-    )
+    log.info("startup transport=stdio log_level=%s", LOG_LEVEL)
     log.info(
         "HA config url=%s token=%s timeout=%ss verify_ssl=%s ws_enabled=%s ws_url=%s",
         _safe_url(os.environ.get("HA_URL", "(not set)")),
@@ -704,28 +638,7 @@ def main() -> None:
         os.environ.get("HA_WS_ENABLED", "true"),
         os.environ.get("HA_WS_URL") or "(derived from HA_URL)",
     )
-    if transport == "stdio":
-        mcp.run(transport="stdio")
-        return
-    import uvicorn
-    from starlette.routing import Route
-
-    if transport == "sse":
-        app = mcp.sse_app(sse_path=sse_path, host=MCP_HOST)
-    else:  # streamable-http
-        app = mcp.streamable_http_app(
-            streamable_http_path=mcp_path,
-            stateless_http=MCP_STATELESS,
-            host=MCP_HOST,
-        )
-    app.router.routes.append(Route("/health", _health, methods=["GET"]))
-    app.router.routes.append(Route("/ready", _ready, methods=["GET"]))
-    uvicorn.run(
-        app,
-        host=MCP_HOST,
-        port=MCP_PORT,
-        log_level=LOG_LEVEL.lower(),
-    )
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

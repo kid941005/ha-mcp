@@ -473,5 +473,5 @@ def build_service(action: str, domain: str, value: Any) -> tuple:
 
 
 def _hint() -> str:
-    return "请检查 HA_URL / HA_TOKEN 配置与网络连通性；可用 /ready 或 README「排查」章节定位问题。"
+    return "请检查 HA_URL / HA_TOKEN 配置与网络连通性；可查看容器日志或 README「排查」章节定位问题。"
 

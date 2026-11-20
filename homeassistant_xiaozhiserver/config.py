@@ -86,12 +86,7 @@ def env_set(name: str, default: str) -> set[str]:
     return {x.strip().lower() for x in raw.split(",") if x.strip()}
 
 
-# 服务与传输
-MCP_HOST = env_str("MCP_HOST", "0.0.0.0")
-MCP_PORT = env_int("MCP_PORT", 8090, 1, 65535)
-MCP_PATH = env_str("MCP_PATH", "/mcp")
-MCP_SSE_PATH = env_str("MCP_SSE_PATH", "/sse")
-MCP_STATELESS = env_bool("MCP_STATELESS", False)
+# 日志（服务固定 stdio，不解析 HTTP 监听参数）
 LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
 if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
     log.warning("环境变量 LOG_LEVEL=%r 非法，使用 INFO", LOG_LEVEL)
