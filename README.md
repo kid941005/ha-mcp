@@ -206,7 +206,7 @@ python -m homeassistant_xiaozhiserver
 
 ```yaml
   homeassistant-xiaozhiserver:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.7.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     environment:
@@ -431,7 +431,7 @@ services:
     build:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile.bridge
-    image: homeassistant-xiaozhiserver-bridge:1.7.0
+    image: homeassistant-xiaozhiserver-bridge:latest
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:

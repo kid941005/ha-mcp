@@ -9,8 +9,8 @@ services:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile.bridge
       args:
-        BASE_IMAGE: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.7.0
-    image: homeassistant-xiaozhiserver-bridge:1.7.0
+        BASE_IMAGE: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
+    image: homeassistant-xiaozhiserver-bridge:latest
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:
