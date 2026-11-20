@@ -53,23 +53,27 @@ def _controllability(entity_id: str, state: Any) -> dict:
 def _registry_maps(reg: Optional[dict]) -> tuple:
     devices: dict = {}
     ents: dict = {}
+    areas: dict = {}
     if not reg:
-        return devices, ents
+        return devices, ents, areas
     for d in reg.get("devices") or []:
         if isinstance(d, dict) and d.get("id"):
             devices[d["id"]] = d
     for e in reg.get("entities") or []:
         if isinstance(e, dict) and e.get("entity_id"):
             ents[e["entity_id"]] = e
-    return devices, ents
+    for a in reg.get("areas") or []:
+        if isinstance(a, dict) and a.get("area_id"):
+            areas[a["area_id"]] = a.get("name") or a.get("area_id")
+    return devices, ents, areas
 
 def _device_label(d: Optional[dict]) -> Optional[str]:
     if not d:
         return None
     return d.get("name_by_user") or d.get("name") or d.get("id")
 
-def _entity_view(st: dict, devices: dict, ents: dict) -> dict:
-    """在实体摘要基础上补充 controllable 标记与所属设备信息。"""
+def _entity_view(st: dict, devices: dict, ents: dict, areas: Optional[dict] = None) -> dict:
+    """在实体摘要基础上补充 controllable 标记、所属设备与区域信息。"""
     v = summarize(st)
     v.update(_controllability(st.get("entity_id", ""), st.get("state")))
     v.update(_danger_info(st.get("entity_id", ""), st.get("attributes") or {}))
@@ -79,10 +83,12 @@ def _entity_view(st: dict, devices: dict, ents: dict) -> dict:
     v["device_id"] = did
     d = devices.get(did) if did else None
     v["device_name"] = _device_label(d)
-    v["area_id"] = (d.get("area_id") if d else None) or re.get("area_id")
+    area_id = (d.get("area_id") if d else None) or re.get("area_id")
+    v["area_id"] = area_id
+    v["area_name"] = (areas or {}).get(area_id) if area_id else None
     return v
 
-def _group_by_device(views: list, devices: dict) -> list:
+def _group_by_device(views: list, devices: dict, areas: Optional[dict] = None) -> list:
     """把实体按 device_id 聚合为设备；无 device_id 的实体各自成组。"""
     groups: dict = {}
     order: list = []
@@ -92,12 +98,14 @@ def _group_by_device(views: list, devices: dict) -> list:
         g = groups.get(key)
         if g is None:
             d = devices.get(did) if did else None
+            area_id = (d.get("area_id") if d else None) or v.get("area_id")
             g = {
                 "device_id": did,
                 "name": _device_label(d) if d else v.get("name"),
                 "manufacturer": (d.get("manufacturer") if d else None),
                 "model": (d.get("model") if d else None),
-                "area_id": (d.get("area_id") if d else None) or v.get("area_id"),
+                "area_id": area_id,
+                "area_name": (areas or {}).get(area_id) if area_id else v.get("area_name"),
                 "controllable": False,
                 "dangerous": False,
                 "entity_count": 0,

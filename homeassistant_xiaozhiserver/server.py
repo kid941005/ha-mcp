@@ -145,17 +145,21 @@ def _log_tool(name: str):
 @mcp.tool()
 @_log_tool("list_devices")
 async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = None,
+                       area: Optional[str] = None,
                        controllable_only: bool = False, group_by: str = "entity",
                        limit: Optional[int] = None, offset: int = 0) -> dict:
     """列出/查询 Home Assistant 中的设备。
 
-    可按 keyword（设备名称或 entity_id 关键字，模糊匹配）和 domain（设备类型，
-    如 light/switch/sensor/climate/cover/media_player/fan/vacuum/scene）过滤；
+    可按 keyword（设备名称或 entity_id 关键字，模糊匹配）、domain（设备类型，
+    如 light/switch/sensor/climate/cover/media_player/fan/vacuum/scene）和 area
+    （区域名称或 area_id，模糊匹配，如「客厅」「living_room」）过滤，多个条件
+    同时生效（如 area="客厅", domain="light" 只返回客厅的灯）；
     controllable_only=true 只返回可控制的设备；group_by="device" 时按物理设备聚合
     （一个设备下的多个实体合并为一项，含 manufacturer/model/area 与 entities 列表）；
     结果支持分页：limit 每页条数，offset 起始偏移（默认从 0 开始）。
 
-    每个实体带 controllable（是否可控制）、actions（内置动作）、device_id/device_name/area_id。
+    每个实体带 controllable（是否可控制）、actions（内置动作）、
+    device_id/device_name/area_id/area_name。
     适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」「哪些设备能控制」。
     """
     try:
@@ -165,8 +169,8 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
             reg = await ha.get_registries()
         except HAError:
             reg = None
-        devices_map, ents_map = _registry_maps(reg)
-        views = [_entity_view(s, devices_map, ents_map) for s in states]
+        devices_map, ents_map, areas_map = _registry_maps(reg)
+        views = [_entity_view(s, devices_map, ents_map, areas_map) for s in states]
         if domain:
             d = domain.strip().lower()
             views = [v for v in views if str(v.get("entity_id", "")).startswith(d + ".")]
@@ -178,12 +182,19 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
                 or kw in str(v.get("entity_id", "")).lower()
                 or kw in str(v.get("device_name") or "").lower()
             ]
+        if area:
+            av = area.strip().lower()
+            views = [
+                v for v in views
+                if av in str(v.get("area_name") or "").lower()
+                or av in str(v.get("area_id") or "").lower()
+            ]
         if controllable_only:
             views = [v for v in views if v.get("controllable")]
 
         mode = (group_by or "entity").strip().lower()
         if mode in ("device", "devices", "设备"):
-            items = _group_by_device(views, devices_map)
+            items = _group_by_device(views, devices_map, areas_map)
             grouped_by = "device"
         elif mode in ("entity", "entities", "实体"):
             items = views
@@ -207,6 +218,7 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
         msg += "（还有更多，可用 offset=" + str(next_off) + " 继续）" if has_more else "。"
         return {
             "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
+            "area": (area.strip() if area else None),
             "total": total, "count": len(page), "offset": off,
             "limit": lim, "has_more": has_more,
             "next_offset": next_off if has_more else None,
@@ -245,8 +257,8 @@ async def get_device_state(entity: str, include_all_attributes: bool = False) ->
             reg = await ha.get_registries()
         except HAError:
             reg = None
-        devices_map, ents_map = _registry_maps(reg)
-        s = _entity_view(st, devices_map, ents_map)
+        devices_map, ents_map, areas_map = _registry_maps(reg)
+        s = _entity_view(st, devices_map, ents_map, areas_map)
         s["last_changed"] = st.get("last_changed")
         s["last_updated"] = st.get("last_updated")
         all_attrs = st.get("attributes")

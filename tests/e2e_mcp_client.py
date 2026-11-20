@@ -67,6 +67,20 @@ def verify_case(index, name, args, r, expected):
     if "entity_state" in expected:
         check((d.get("entity") or {}).get("state") == expected["entity_state"],
               label + " entity.state", (d.get("entity") or {}).get("state"))
+    if "entity_area_id" in expected:
+        check((d.get("entity") or {}).get("area_id") == expected["entity_area_id"],
+              label + " entity.area_id", (d.get("entity") or {}).get("area_id"))
+    if "entity_area_name" in expected:
+        check((d.get("entity") or {}).get("area_name") == expected["entity_area_name"],
+              label + " entity.area_name", (d.get("entity") or {}).get("area_name"))
+    if "first_area_name" in expected:
+        devices = d.get("devices") or []
+        check(bool(devices) and devices[0].get("area_name") == expected["first_area_name"],
+              label + " devices[0].area_name", (devices[0] if devices else {}).get("area_name"))
+    if "first_domain" in expected:
+        devices = d.get("devices") or []
+        check(bool(devices) and devices[0].get("domain") == expected["first_domain"],
+              label + " devices[0].domain", (devices[0] if devices else {}).get("domain"))
     if "entity_dangerous" in expected:
         check((d.get("entity") or {}).get("dangerous") is expected["entity_dangerous"],
               label + " entity.dangerous", (d.get("entity") or {}).get("dangerous"))
@@ -105,6 +119,16 @@ async def main():
                                    "grouped_by": "entity"}),
             ("list_devices", {"domain": "light"}, {"ok": True, "total": 1}),
             ("list_devices", {"keyword": "客厅"}, {"ok": True, "total": 3}),
+            ("list_devices", {"area": "客厅"}, {"ok": True, "total": 6,
+                                                "first_area_name": "客厅"}),
+            ("list_devices", {"area": "玄关"}, {"ok": True, "total": 1}),
+            ("list_devices", {"area": "客厅", "group_by": "device"},
+             {"ok": True, "total": 5, "grouped_by": "device"}),
+            ("list_devices", {"area": "客厅", "domain": "light"},
+             {"ok": True, "total": 1, "first_domain": "light"}),
+            ("list_devices", {"area": "客厅", "domain": "switch"},
+             {"ok": True, "total": 1, "first_domain": "switch"}),
+            ("list_devices", {"area": "不存在"}, {"ok": True, "total": 0}),
             ("list_devices", {"controllable_only": True}, {"ok": True, "total": 6}),
             ("list_devices", {"group_by": "device"}, {"ok": True, "total": 6,
                                                        "grouped_by": "device"}),
@@ -119,7 +143,8 @@ async def main():
             ("list_services", {"domain": "light"}, {"ok": True, "domain": "light"}),
             # 状态查询
             ("get_device_state", {"entity": "客厅灯"},
-             {"ok": True, "entity_state": "off"}),
+             {"ok": True, "entity_state": "off", "entity_area_id": "living_room",
+              "entity_area_name": "客厅"}),
             ("get_device_state", {"entity": "sensor.living_temp"},
              {"ok": True, "entity_state": "24.5"}),
             ("get_device_state", {"entity": "大门门锁"},

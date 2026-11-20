@@ -5,7 +5,7 @@
 
   # ========== homeassistant-xiaozhiserver（小智 MCP 服务）==========
   homeassistant-xiaozhiserver:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.6.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.9.0
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     environment:

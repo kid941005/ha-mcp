@@ -116,7 +116,7 @@ SERVICES = [
 ]
 
 
-# 设备注册表 / 实体注册表（复刻 HA WebSocket API config/*_registry/list 的返回结构）
+# 设备注册表 / 实体注册表 / 区域注册表（复刻 HA WebSocket API config/*_registry/list 的返回结构）
 DEVICE_REGISTRY = [
     {"id": "dev_living", "name": "客厅环境组", "name_by_user": None, "manufacturer": "DemoTech",
      "model": "Living Kit", "model_id": "LK-1", "area_id": "living_room", "disabled_by": None},
@@ -130,6 +130,10 @@ DEVICE_REGISTRY = [
      "model": "C1", "model_id": "C1", "area_id": "living_room", "disabled_by": None},
     {"id": "dev_lock", "name": "大门门锁", "name_by_user": None, "manufacturer": "SafeCo",
      "model": "L1", "model_id": "L1", "area_id": "entrance", "disabled_by": None},
+]
+AREA_REGISTRY = [
+    {"area_id": "living_room", "name": "客厅"},
+    {"area_id": "entrance", "name": "玄关"},
 ]
 ENTITY_REGISTRY = [
     {"entity_id": "light.living_room", "device_id": "dev_living", "area_id": None,
@@ -259,6 +263,8 @@ async def _ws_handler(ws):
             result = DEVICE_REGISTRY
         elif typ == "config/entity_registry/list":
             result = ENTITY_REGISTRY
+        elif typ == "config/area_registry/list":
+            result = AREA_REGISTRY
         else:
             await ws.send(json.dumps({"id": rid, "type": "result", "success": False,
                                       "error": {"code": "unknown_command", "message": "Unknown command."}}))

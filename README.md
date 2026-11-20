@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.8.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
+当前版本：**v1.9.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
 
 ---
 
@@ -30,7 +30,7 @@
 | 能力 | 说明 |
 |---|---|
 | 六个 MCP 工具 | `list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains`，名称、描述与参数均面向自然语言路由设计 |
-| 设备发现与状态 | 支持按名称/entity_id 模糊查询，按 `domain` 过滤，支持分页；状态查询默认裁剪为关键属性，避免上下文膨胀 |
+| 设备发现与状态 | 支持按名称/entity_id 模糊查询，按 `domain`、`area` 过滤且条件可组合；状态查询默认裁剪为关键属性，避免上下文膨胀 |
 | 常用控制 | 开关、亮度、音量、温度、色温、颜色、窗帘、门锁等常用动作，按设备 domain 自动映射到对应 HA 服务 |
 | 能力自描述 | `list_services` 查询某类或某个设备支持哪些服务及参数字段，先看能力再调用 |
 | 通用服务调用 | `call_service` 可执行任意 HA 服务，覆盖 `control_device` 未封装的能力 |
@@ -248,16 +248,19 @@ docker compose ps homeassistant-xiaozhiserver
 |---|---|---|---|
 | `keyword` | string | 否 | 名称、entity_id 或所属设备名关键字，模糊匹配（如「客厅」「灯」） |
 | `domain` | string | 否 | 设备类型过滤：`light` / `switch` / `sensor` / `climate` / `cover` / `media_player` / `fan` / `vacuum` / `scene` 等 |
+| `area` | string | 否 | 区域过滤：区域名称或 `area_id`，模糊匹配（如「客厅」「living_room」）；依赖 HA 区域注册表返回 `area_name`，按 `area_id` 过滤始终可用 |
 | `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体） |
 | `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合） |
 | `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`，上限 `MAX_LIST_LIMIT` |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
-返回（entity 模式）：`{ok, grouped_by:"entity", registry_available, total, count, offset, limit, has_more, next_offset, devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id}], message}`。
+> `keyword`、`domain`、`area` 可任意组合，例如 `{"area":"客厅","domain":"light"}` 只返回客厅的灯。
 
-返回（device 模式）：`{ok, grouped_by:"device", registry_available, total, count, offset, limit, has_more, next_offset, devices:[{device_id,name,manufacturer,model,area_id,controllable,dangerous,entity_count,entities:[...]}], message}`。
+返回（entity 模式）：`{ok, grouped_by:"entity", registry_available, area, total, count, offset, limit, has_more, next_offset, devices:[{entity_id,name,domain,state,unit,device_class,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,area_name}], message}`。
 
-> `registry_available:false` 表示 HA WebSocket 注册表不可用（令牌无权限、WS 不通等），此时自动降级为按实体展示，不影响状态查询与控制。
+返回（device 模式）：`{ok, grouped_by:"device", registry_available, area, total, count, offset, limit, has_more, next_offset, devices:[{device_id,name,manufacturer,model,area_id,area_name,controllable,dangerous,entity_count,entities:[...]}], message}`。
+
+> `registry_available:false` 表示 HA WebSocket 设备/实体注册表不可用（令牌无权限、WS 不通等），此时自动降级为按实体展示，不影响状态查询与控制。区域注册表单独读取失败时只令 `area_name` 为 `null`，按 `area_id` 过滤仍可用。
 
 ### 6.2 `get_device_state` — 获取设备状态
 
@@ -266,7 +269,7 @@ docker compose ps homeassistant-xiaozhiserver
 | `entity` | string | 是 | entity_id（如 `light.living_room`）或友好名称（如「客厅灯」）；服务端自动解析，多义时返回候选 |
 | `include_all_attributes` | bool | 否 | 默认 `false` 只返回关键属性；需要完整 attributes 时传 `true` |
 
-返回：`{ok, entity:{entity_id,name,domain,state,unit,attributes,attributes_truncated,attribute_count,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,last_changed,last_updated}, message}`。
+返回：`{ok, entity:{entity_id,name,domain,state,unit,attributes,attributes_truncated,attribute_count,controllable,actions,controllable_reason,dangerous,danger_reason,device_id,device_name,area_id,area_name,last_changed,last_updated}, message}`。
 
 默认只返回亮度、色温、音量、温度、位置、电池等关键属性，避免媒体/摄像头等实体的巨大 attributes 占用上下文；`attributes_truncated=true` 表示还有更多属性。
 
@@ -481,6 +484,8 @@ docker logs -f homeassistant-xiaozhiserver-bridge
 | 家里有哪些设备？ | `list_devices` | `{}` | `{"ok":true,"total":7,"count":7,"has_more":false,"devices":[...]}` |
 | 列出所有的灯 | `list_devices` | `{"domain":"light"}` | `total=1, devices=[{"name":"客厅灯","state":"off"}]` |
 | 客厅都有什么设备？ | `list_devices` | `{"keyword":"客厅"}` | `total=3` |
+| 客厅区域有哪些设备？ | `list_devices` | `{"area":"客厅"}` | `total=6`（区域匹配，含 light/switch 等） |
+| 客厅有哪些灯？ | `list_devices` | `{"area":"客厅","domain":"light"}` | `total=1`，只返回客厅的 `light` 实体 |
 | 哪些设备能控制？ | `list_devices` | `{"controllable_only":true}` | `total=6`（自动排除只读 sensor） |
 | 按物理设备看看家里有什么 | `list_devices` | `{"group_by":"device"}` | `devices=[{"name":"客厅环境组","entity_count":2,"controllable":true,"entities":[...]}]` |
 | 家里有哪些类型的设备？ | `list_domains` | `{}` | `{"domains":{"light":1,"switch":1,...}}` |
@@ -615,7 +620,7 @@ python tests/e2e_mcp_client.py
 
 ## 11. 设备规模与性能
 
-- `list_devices` 支持 `keyword` / `domain` 过滤 + `limit` / `offset` 分页（默认 50、上限 500），返回 `has_more` / `next_offset` 便于续拉，避免实体过多撑爆上下文；
+- `list_devices` 支持 `keyword` / `domain` / `area` 过滤 + `limit` / `offset` 分页（默认 50、上限 500），返回 `has_more` / `next_offset` 便于续拉，避免实体过多撑爆上下文；
 - `group_by="device"` 按物理设备聚合，`controllable_only=true` 只看可控设备，进一步压缩结果；
 - `get_device_state` 默认只返回关键属性（亮度、色温、音量、温度、位置、电池等），完整属性需显式传 `include_all_attributes=true`；
 - `list_services` 指定 entity/domain 时返回字段明细，未指定时默认只返回服务名，便于按需展开。
@@ -636,6 +641,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.9.0 | 新增区域名称返回与区域过滤：`list_devices` 支持 `area`，实体/设备视图返回 `area_id`/`area_name`，可与 `domain`/`keyword` 组合（如 `area="客厅", domain="light"`）；区域注册表失败时仅降级 `area_name` |
 | v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；Dockerfile.bridge 改为从源码安装依赖；streamable-http 与 stdio 验证通过；新增带 `call_id` 的结构化日志、工具调用耗时/错误码/动作回读记录与敏感信息脱敏，便于快速排障 |
 | v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、`Dockerfile.bridge`、bridge compose overlay；README 补充方式 A 接入说明 |
 | v1.6.0 | 项目、Python 包、Docker 服务/镜像/容器统一更名为 `homeassistant-xiaozhiserver`；README 全面重写；部署 compose、工具说明与错误处理文档完善 |

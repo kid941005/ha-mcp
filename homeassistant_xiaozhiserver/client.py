@@ -180,10 +180,10 @@ class HAClient:
         return ctx
 
     async def get_registries(self, force: bool = False) -> dict | None:
-        """读取 HA 的设备注册表与实体注册表（带 TTL 缓存）。
+        """读取 HA 的设备、实体与区域注册表（带 TTL 缓存）。
 
-        返回 {"devices": [...], "entities": [...]}；WebSocket 不可用/无权限时返回 None，
-        调用方应降级为按实体展示，不影响其它功能。
+        返回 {"devices": [...], "entities": [...], "areas": [...]}；WebSocket 不可用/无权限时返回 None，
+        调用方应降级为按实体展示，不影响其它功能。区域注册表读取失败时不影响设备/实体注册表。
         """
         if not self.ws_enabled or websockets is None:
             return None
@@ -197,9 +197,10 @@ class HAClient:
             return None
         try:
             data = await self._ws_registries()
-            log.debug("HA registry loaded: devices=%s entities=%s",
+            log.debug("HA registry loaded: devices=%s entities=%s areas=%s",
                       len((data or {}).get("devices") or []),
-                      len((data or {}).get("entities") or []))
+                      len((data or {}).get("entities") or []),
+                      len((data or {}).get("areas") or []))
         except HAError as e:
             log.warning("HA registry unavailable: %s (%s)", e.message, e.code)
             data = None
@@ -224,21 +225,30 @@ class HAClient:
                         raise HAError("auth_failed", "Home Assistant WebSocket 鉴权失败：请检查 HA_TOKEN 是否有效。")
                 elif hello.get("type") != "auth_ok":
                     raise HAError("ws_error", "Home Assistant WebSocket 握手异常：" + str(hello.get("type")))
-                cmds = [(1, "config/device_registry/list"), (2, "config/entity_registry/list")]
+                cmds = [(1, "config/device_registry/list"), (2, "config/entity_registry/list"),
+                        (3, "config/area_registry/list")]
                 for cid, ctype in cmds:
                     await ws.send(json.dumps({"id": cid, "type": ctype}))
-                out: dict = {"devices": [], "entities": []}
+                out: dict = {"devices": [], "entities": [], "areas": []}
                 for _ in cmds:
                     msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=self.timeout))
                     if msg.get("type") != "result":
                         continue
                     if not msg.get("success"):
                         err = msg.get("error") or {}
-                        raise HAError("registry_error", "读取 Home Assistant 注册表失败：" + str(err.get("message") or err))
+                        text = str(err.get("message") or err)
+                        # 区域注册表属于增强信息，失败时只降级区域名，不影响设备/实体。
+                        if msg.get("id") == 3:
+                            log.warning("HA area registry unavailable: %s", text)
+                            out["areas"] = []
+                            continue
+                        raise HAError("registry_error", "读取 Home Assistant 注册表失败：" + text)
                     if msg.get("id") == 1:
                         out["devices"] = msg.get("result") or []
                     elif msg.get("id") == 2:
                         out["entities"] = msg.get("result") or []
+                    elif msg.get("id") == 3:
+                        out["areas"] = msg.get("result") or []
                 return out
         except asyncio.TimeoutError as e:
             raise HAError("timeout", "连接 Home Assistant WebSocket 超时。", str(e)) from e
