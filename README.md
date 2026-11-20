@@ -636,7 +636,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；Dockerfile.bridge 改为从源码安装依赖；streamable-http 与 stdio 验证通过 |
+| v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；Dockerfile.bridge 改为从源码安装依赖；streamable-http 与 stdio 验证通过；新增带 `call_id` 的结构化日志、工具调用耗时/错误码/动作回读记录与敏感信息脱敏，便于快速排障 |
 | v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、`Dockerfile.bridge`、bridge compose overlay；README 补充方式 A 接入说明 |
 | v1.6.0 | 项目、Python 包、Docker 服务/镜像/容器统一更名为 `homeassistant-xiaozhiserver`；README 全面重写；部署 compose、工具说明与错误处理文档完善 |
 | v1.5.0 | 拆分为独立 Python 包；配置集中解析；`/health` 与 `/ready` 分离；属性裁剪；注册表失败短重试；危险 cover 识别；测试断言与清理 |
