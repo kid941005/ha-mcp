@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.10.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.10.1** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -451,6 +451,7 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 - `MCP_ENDPOINT` 含 token，只放 `.env` 或运行时环境变量，不要提交到 Git、不要写进镜像。
 - 不要把 `/mcp_endpoint/health?key=...` 填进 `MCP_ENDPOINT`。
 - 断线重连会重新启动 `server.py`；危险确认令牌是进程内内存，重连后旧令牌失效，需要重新发起原操作。
+- `deploy/data/.mcp_server_settings.json` 是 xiaozhi-server 的旧「方式 B」MCP 配置；改用接入点后应清空为 `{"mcpServers": {}}`（或删除），否则它会继续连接已移除的 `http://homeassistant-xiaozhiserver:8090/mcp`，造成报错或工具重复。
 
 ---
 
@@ -495,6 +496,9 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
 
 ---
+
+## 9. 错误处理与排查
+
 ### 9.1 错误码
 
 | code | 含义 | 处理建议 |
@@ -521,6 +525,7 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 | `confirm_token_mismatch` | 令牌与本次实体/服务/参数不匹配 | 重新发起原操作获取新令牌，勿改参数复用 |
 | `ws_error` / `registry_error` | HA WebSocket 注册表读取失败 | 一般会降级为按实体展示；检查 WS 权限/网络，或设 `HA_WS_ENABLED=false` |
 | `internal_error` | 未预期的内部错误 | 查看服务日志，确认 HA 版本与请求参数 |
+
 ### 9.2 排查步骤
 
 1. **看 bridge 日志**：`docker logs -f homeassistant-xiaozhiserver-bridge`。
@@ -613,6 +618,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.10.1 | 全项目冗余审计与清理：补齐 README 第 9 章标题、清理 xiaozhi-server 旧「方式 B」MCP 配置（`deploy/data/.mcp_server_settings.json` 置空）、更新 `deploy/.env` 服务名并补充 `MCP_ENDPOINT` 说明；代码层确认已无 HTTP/SSE/uvicorn/端口残留 |
 | v1.10.0 | 仅保留方式 A：移除 HTTP / SSE / streamable-http、8090 端口、`/health` / `/ready`、uvicorn 与方式 B 配置；`Dockerfile` 统一为 stdio bridge 镜像；`mcp_pipe.py` 只支持 stdio 子进程；测试改为 stdio 客户端；compose 不再暴露端口 |
 | v1.9.1 | 全面审计修复：`HA_VERIFY_SSL` 非法值回退默认、`HA_URL` 启动校验、WebSocket 注册表按 `result.id` 收集、回读失败标记 `accepted_pending` 并返回 `readback_errors`、分页/布尔参数健壮性、危险确认令牌容量上限、补齐 `resume` 动作与区域名回退 |
 | v1.9.0 | 新增区域名称返回与区域过滤：`list_devices` 支持 `area`，实体/设备视图返回 `area_id`/`area_name`，可与 `domain`/`keyword` 组合（如 `area="客厅", domain="light"`）；区域注册表失败时仅降级 `area_name` |
