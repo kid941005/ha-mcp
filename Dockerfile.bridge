@@ -1,0 +1,15 @@
+# homeassistant-xiaozhiserver — MCP 接入点桥接镜像（stdio ↔ WebSocket）
+# 构建上下文：项目根目录（与 Dockerfile.bridge 同级）
+ARG BASE_IMAGE=ghcr.io/kid941005/homeassistant-xiaozhiserver:1.7.0
+FROM ${BASE_IMAGE}
+
+USER root
+RUN pip install --no-cache-dir "python-dotenv>=1.0,<2"
+
+# 基础镜像只有包；补上兼容入口与桥接脚本
+COPY server.py /app/server.py
+COPY mcp_pipe.py /app/mcp_pipe.py
+
+USER appuser
+ENV MCP_TRANSPORT=stdio
+CMD ["python", "/app/mcp_pipe.py", "/app/server.py"]

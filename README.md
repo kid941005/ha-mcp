@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.6.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
+当前版本：**v1.7.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
 
 ---
 
@@ -206,7 +206,7 @@ python -m homeassistant_xiaozhiserver
 
 ```yaml
   homeassistant-xiaozhiserver:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.6.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.7.0
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     environment:
@@ -404,14 +404,71 @@ docker logs xiaozhi-esp32-server 2>&1 | grep -i "MCP"
 
 ### 方式 A：MCP 接入点（mcp-endpoint-server）
 
-适用于「MCP 接入点」集中管理（工具服务以 **stdio** 方式运行，再由 `mcp_pipe.py` 通过 WebSocket 连到接入点地址 `ws://<host>:8004/mcp_endpoint/mcp/?token=xxx`）：
+适用于「MCP 接入点」集中管理：本服务以 **stdio** 方式运行，由 `mcp_pipe.py` 通过 WebSocket 连接 `mcp-endpoint-server` 的工具端地址。`/mcp_endpoint/health?key=...` 只是智控台参数地址，不能作为工具连接地址。
+
+#### A1. 本机快速验证
 
 ```bash
-export HA_URL=... HA_TOKEN=... MCP_TRANSPORT=stdio
-python mcp_pipe.py server.py --endpoint "ws://<host>:8004/mcp_endpoint/mcp/?token=xxx"
+cd D:/dsh/esp32/homeassistant-xiaozhiserver
+python -m pip install -r requirements.txt python-dotenv
+export MCP_ENDPOINT="ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>"  # (待补充：接入点日志中的工具端地址)
+export HA_URL="https://your-ha.example:8123"                         # (待补充：你的 HA 地址)
+export HA_TOKEN="<HA 长期访问令牌>"                                  # (待补充：你的 HA 令牌)
+export MCP_TRANSPORT=stdio
+python mcp_pipe.py server.py
+# 成功日志：MCP接入点连接成功 / MCP接入点支持的工具数量: 6
 ```
 
-> `mcp_pipe.py` 来自 xinnan-tech/mcp-endpoint-server，按该仓库说明使用；接入点在智控台配置。
+> 不要把 `MCP_ENDPOINT`、`HA_TOKEN` 写进代码或 Git；只放本机环境变量或 `deploy/.env`。
+
+#### A2. Docker Compose 常驻
+
+项目内提供 `Dockerfile.bridge`，基于 GHCR 运行镜像加入 `mcp_pipe.py`：
+
+```yaml
+services:
+  homeassistant-xiaozhiserver-bridge:
+    build:
+      context: ../homeassistant-xiaozhiserver
+      dockerfile: Dockerfile.bridge
+    image: homeassistant-xiaozhiserver-bridge:1.7.0
+    container_name: homeassistant-xiaozhiserver-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      MCP_TRANSPORT: stdio
+```
+
+也可直接使用 `integration/docker-compose.mcp-bridge.fragment.yml` 片段。
+
+在 `D:/dsh/esp32/deploy/.env` 增加（值用占位符，不要提交）：
+
+```dotenv
+MCP_ENDPOINT=ws://<宿主>:8004/mcp_endpoint/mcp/?token=<TOKEN>
+HA_URL=https://your-ha.example:8123
+HA_TOKEN=<HA 长期访问令牌>
+```
+
+启动与日志：
+
+```bash
+cd D:/dsh/esp32/deploy
+docker compose -f docker-compose.yml -f docker-compose.mcp-bridge.yml up -d --build homeassistant-xiaozhiserver-bridge
+docker logs -f homeassistant-xiaozhiserver-bridge
+```
+
+#### A3. 网络连通
+
+- **同网络**：把 bridge 与 `mcp-endpoint-server` 放进同一个 Docker 网络，`MCP_ENDPOINT` 用服务名，例如 `ws://mcp-endpoint-server:8004/mcp_endpoint/mcp/?token=<TOKEN>`。
+- **不同网络**：`MCP_ENDPOINT` 用宿主机/目标机可达地址，例如 `ws://192.168.1.10:8004/mcp_endpoint/mcp/?token=<TOKEN>`；确保防火墙放行 **出站** 到该端口。本服务是主动连出，不需要为 `8090` 做公网映射。
+
+#### A4. 接入结果核对
+
+智控台刷新 MCP 接入状态后，应看到 6 个工具：`list_devices`、`get_device_state`、`control_device`、`list_services`、`call_service`、`list_domains`。
+
+> 方式 B（`url: http://homeassistant-xiaozhiserver:8090/mcp`）与方式 A（stdio bridge）同时存在会导致工具重复暴露；二选一即可。当前若只用方式 A，可把方式 B 的 xiaozhi MCP settings 移除。
 
 ---
 
@@ -565,6 +622,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、`Dockerfile.bridge`、bridge compose overlay；README 补充方式 A 接入说明 |
 | v1.6.0 | 项目、Python 包、Docker 服务/镜像/容器统一更名为 `homeassistant-xiaozhiserver`；README 全面重写；部署 compose、工具说明与错误处理文档完善 |
 | v1.5.0 | 拆分为独立 Python 包；配置集中解析；`/health` 与 `/ready` 分离；属性裁剪；注册表失败短重试；危险 cover 识别；测试断言与清理 |
 | v1.4.0 | 危险设备二次确认（一次性令牌防误操作） |

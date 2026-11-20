@@ -2,7 +2,7 @@
 # 用法：cp .env.example .env 并填写 HA_URL/HA_TOKEN，然后 docker compose pull && docker compose up -d
 services:
   homeassistant-xiaozhiserver:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.6.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.7.0
     container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     env_file:
