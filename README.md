@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-esp32-server）**或任意 MCP 客户端通过自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.7.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
+当前版本：**v1.8.0** · Python 3.12 · 传输：`streamable-http`（默认）/ `sse` / `stdio`
 
 ---
 
@@ -423,7 +423,7 @@ python mcp_pipe.py server.py
 
 #### A2. Docker Compose 常驻
 
-项目内提供 `Dockerfile.bridge`，基于 GHCR 运行镜像加入 `mcp_pipe.py`：
+项目内提供 `Dockerfile.bridge`，从源码安装 mcp 2.x 依赖并加入 `mcp_pipe.py`：
 
 ```yaml
 services:
@@ -622,6 +622,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.8.0 | 升级 MCP Python SDK 至 2.3.0：FastMCP 改为 MCPServer，e2e 客户端改用 mcp.Client；Dockerfile.bridge 改为从源码安装依赖；streamable-http 与 stdio 验证通过 |
 | v1.7.0 | 新增小智 MCP 接入点（工具端 WebSocket）支持：`mcp_pipe.py`、`Dockerfile.bridge`、bridge compose overlay；README 补充方式 A 接入说明 |
 | v1.6.0 | 项目、Python 包、Docker 服务/镜像/容器统一更名为 `homeassistant-xiaozhiserver`；README 全面重写；部署 compose、工具说明与错误处理文档完善 |
 | v1.5.0 | 拆分为独立 Python 包；配置集中解析；`/health` 与 `/ready` 分离；属性裁剪；注册表失败短重试；危险 cover 识别；测试断言与清理 |

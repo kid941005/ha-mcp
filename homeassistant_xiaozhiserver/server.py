@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .config import (
     DEFAULT_LIST_LIMIT,
@@ -48,7 +48,7 @@ from .views import (
     _registry_maps,
 )
 
-mcp = FastMCP(
+mcp = MCPServer(
     "homeassistant-xiaozhiserver",
     instructions=(
         "把 Home Assistant 的智能家居设备封装为 MCP 工具。"
@@ -65,12 +65,7 @@ mcp = FastMCP(
         "需要执行上述未覆盖的任意 HA 服务时用 call_service（服务名 + 参数 JSON）；"
         "不确定设备类型时先用 list_domains 查看有哪些类别。"
     ),
-    host=MCP_HOST,
-    port=MCP_PORT,
-    streamable_http_path=MCP_PATH,
-    sse_path=MCP_SSE_PATH,
     log_level=LOG_LEVEL,
-    stateless_http=MCP_STATELESS,
 )
 
 _ha: Optional[HAClient] = None
@@ -549,9 +544,13 @@ def main() -> None:
     from starlette.routing import Route
 
     if transport == "sse":
-        app = mcp.sse_app()
+        app = mcp.sse_app(sse_path=MCP_SSE_PATH, host=MCP_HOST)
     else:  # streamable-http
-        app = mcp.streamable_http_app()
+        app = mcp.streamable_http_app(
+            streamable_http_path=MCP_PATH,
+            stateless_http=MCP_STATELESS,
+            host=MCP_HOST,
+        )
     app.router.routes.append(Route("/health", _health, methods=["GET"]))
     app.router.routes.append(Route("/ready", _ready, methods=["GET"]))
     uvicorn.run(

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """HA 服务映射、状态预期与回读校验（与 MCP 传输层解耦）。
 
-本模块只依赖 HAClient/HAError 与配置，不导入 FastMCP，便于单独测试。
+本模块只依赖 HAClient/HAError 与配置，不导入 MCPServer，便于单独测试。
 """
 from __future__ import annotations
 
