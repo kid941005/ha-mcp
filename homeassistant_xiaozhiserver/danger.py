@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 from typing import Optional
@@ -14,6 +15,8 @@ from .config import (
     DANGEROUS_DOMAINS,
 )
 from .service import _domain_of, _friendly_name
+
+log = logging.getLogger("homeassistant_xiaozhiserver.danger")
 
 def _danger_flags(entity_id: str, attributes: Optional[dict]) -> tuple:
     """判断实体是否属于高风险设备（操作需二次确认）。"""
@@ -81,6 +84,7 @@ def _danger_block(st: dict, service_domain: str, service: str,
     token = (confirm_token or "").strip()
     if not token:
         new_token = _issue_confirm_token(eid, service_domain, service, payload)
+        log.warning("danger confirmation required entity=%s service=%s reason=%s", eid, svc_str, reason)
         return {**base, "code": "confirmation_required",
                 "confirm_token": new_token, "expires_in": ttl,
                 "message": "『" + name + "』是危险设备（" + str(reason) + "），为避免误操作未执行。"
@@ -88,16 +92,20 @@ def _danger_block(st: dict, service_domain: str, service: str,
                            "令牌 " + str(ttl) + " 秒内有效且仅可使用一次。"}
     rec = _CONFIRM_TOKENS.get(token)
     if rec is None:
+        log.warning("danger confirmation rejected entity=%s service=%s code=invalid_confirm_token", eid, svc_str)
         return {**base, "code": "invalid_confirm_token",
                 "message": "确认令牌无效或已使用。请重新发起原操作获取新的 confirm_token，并在用户确认后使用。"}
     if float(rec.get("expires_at", 0)) <= time.monotonic():
         _CONFIRM_TOKENS.pop(token, None)
         new_token = _issue_confirm_token(eid, service_domain, service, payload)
+        log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_expired", eid, svc_str)
         return {**base, "code": "confirm_token_expired", "confirm_token": new_token,
                 "expires_in": ttl,
                 "message": "确认令牌已过期。已生成新的 confirm_token；请让用户确认后重新调用。"}
     if rec.get("intent") != expected_intent:
+        log.warning("danger confirmation rejected entity=%s service=%s code=confirm_token_mismatch", eid, svc_str)
         return {**base, "code": "confirm_token_mismatch",
                 "message": "确认令牌与本次操作不匹配（设备、服务或参数已变化）。请重新发起原操作获取新的 confirm_token。"}
     _CONFIRM_TOKENS.pop(token, None)  # 一次性：校验通过即消费
+    log.info("danger confirmation passed entity=%s service=%s", eid, svc_str)
     return None

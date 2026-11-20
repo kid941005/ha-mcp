@@ -79,6 +79,7 @@ homeassistant-xiaozhiserver/
 │   ├── __init__.py
 │   ├── __main__.py                  # python -m homeassistant_xiaozhiserver 入口
 │   ├── config.py                    # 环境变量解析与运行常量（非法值告警并回退）
+│   ├── logging_setup.py             # 统一日志格式、call_id 单次调用追踪
 │   ├── client.py                    # HA REST/WebSocket 客户端、鉴权与错误归一化
 │   ├── service.py                   # 动作映射、状态/属性预期、回读校验
 │   ├── danger.py                    # 危险设备判定、一次性确认令牌
@@ -104,7 +105,8 @@ homeassistant-xiaozhiserver/
 | 模块 | 职责 |
 |---|---|
 | `config.py` | 集中解析环境变量；`env_str` / `env_bool` / `env_int` / `env_float` / `env_set`，非法值不会导致 import 崩溃 |
-| `client.py` | 封装 HA REST 与 WebSocket；统一 `HAError` 错误码；连接池复用；注册表 TTL 与失败短重试 |
+| `logging_setup.py` | 统一日志格式（含 `call_id`）；单次工具调用可串联工具入口、HA 请求与动作回读 |
+| `client.py` | 封装 HA REST 与 WebSocket；统一 `HAError` 错误码；连接池复用；注册表 TTL 与失败短重试；DEBUG 级记录 HA 请求/响应 |
 | `service.py` | 动作 → HA 服务映射；预期状态/属性推导；控制后四态回读校验 |
 | `danger.py` | 判断危险设备；签发/消费一次性 `confirm_token`，绑定实体、服务与参数 |
 | `views.py` | 实体视图、关键属性裁剪、可控性/危险标记、按物理设备聚合 |
@@ -131,7 +133,7 @@ homeassistant-xiaozhiserver/
 | `HA_WS_URL` | | 由 `HA_URL` 推导 | HA WebSocket 地址，如 `ws://homeassistant:8123/api/websocket` |
 | `HA_REGISTRY_TTL` | | `60` | 设备/实体注册表成功缓存秒数 |
 | `HA_REGISTRY_ERROR_TTL` | | `10` | 注册表读取失败后的重试间隔，避免瞬时 WS 故障后长时间不重试 |
-| `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `LOG_LEVEL` | | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL`；非法值告警并回退 `INFO` |
 | `DEFAULT_LIST_LIMIT` | | `50` | `list_devices` 默认每页条数 |
 | `MAX_LIST_LIMIT` | | `500` | `list_devices` 单次最大条数 |
 | `SERVICE_CONFIRM_DELAY` | | `0.6` | 服务调用后回读前的等待秒数 |
@@ -545,7 +547,19 @@ docker logs -f homeassistant-xiaozhiserver-bridge
 1. **看服务健康**：
    - `curl http://127.0.0.1:8090/health`：liveness，仅表示 MCP 进程在运行；
    - `curl http://127.0.0.1:8090/ready`：readiness，HA 可达才 200。返回 `"ha":"reachable"` 正常；`"ha":"error"` 时看 `ha_error` 的具体 code。
-2. **看日志**：`docker logs homeassistant-xiaozhiserver 2>&1 | tail -50`。
+2. **看日志（带 call_id 追踪）**：`docker logs -f homeassistant-xiaozhiserver`。
+   - 每条日志格式：`时间 级别 logger [call_id] 消息`；`call_id` 是单次工具调用的短 ID，可把同一次调用内的工具入口、HA 请求和动作回读串起来。
+   - 常用过滤：
+     ```bash
+     docker logs -f homeassistant-xiaozhiserver 2>&1 | grep -E 'tool=|action |HA registry|readiness failed'
+     docker logs homeassistant-xiaozhiserver 2>&1 | grep '<call_id>'
+     ```
+   - 关键日志示例：
+     - `tool=list_devices start args=...` / `tool=list_devices done ok=true elapsed_ms=...`
+     - `action entity=light.living_room service=light.turn_on status=confirmed verified=True attempts=1 elapsed_ms=...`
+     - `tool=control_device done ok=false code=not_found ...`（失败原因、错误码和耗时直接可见）
+   - `confirm_token` 在日志中显示为 `***`；`HA_TOKEN` 启动日志只显示 `set`/`missing`，不会打印值。
+   - 需要查看每次 HA 请求/响应时设 `LOG_LEVEL=DEBUG`（生产环境建议保持 `INFO`）。
 3. **单独验证 HA**（排除本服务问题）：
    ```bash
    curl -s -H "Authorization: Bearer <你的令牌>" https://your-ha.example:8123/api/states | head -c 300

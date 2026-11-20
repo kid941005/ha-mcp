@@ -82,6 +82,9 @@ MCP_PATH = env_str("MCP_PATH", "/mcp")
 MCP_SSE_PATH = env_str("MCP_SSE_PATH", "/sse")
 MCP_STATELESS = env_bool("MCP_STATELESS", False)
 LOG_LEVEL = env_str("LOG_LEVEL", "INFO").upper()
+if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+    log.warning("环境变量 LOG_LEVEL=%r 非法，使用 INFO", LOG_LEVEL)
+    LOG_LEVEL = "INFO"
 
 # 设备列表
 DEFAULT_LIST_LIMIT = env_int("DEFAULT_LIST_LIMIT", 50, 1, 10000)

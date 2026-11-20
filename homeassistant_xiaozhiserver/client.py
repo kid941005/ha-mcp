@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import ssl
 import time
@@ -18,6 +19,8 @@ from typing import Any
 import httpx
 
 from .config import env_bool, env_float
+
+log = logging.getLogger("homeassistant_xiaozhiserver.client")
 
 try:  # 设备/实体注册表需通过 HA WebSocket API 读取；缺失时降级为按实体展示
     import websockets
@@ -96,6 +99,7 @@ class HAClient:
             self._http = None
 
     async def _request(self, method: str, path: str, json: Any = None) -> Any:
+        log.debug("HA request %s %s", method, path)
         try:
             client = self._client()
             resp = await client.request(method, path, json=json)
@@ -114,6 +118,7 @@ class HAClient:
         except httpx.HTTPError as e:
             raise HAError("network_error", "访问 Home Assistant 发生网络错误：" + str(e), str(e)) from e
 
+        log.debug("HA response %s %s -> %s", method, path, resp.status_code)
         if resp.status_code in (401, 403):
             raise HAError(
                 "auth_failed",
@@ -192,9 +197,14 @@ class HAClient:
             return None
         try:
             data = await self._ws_registries()
-        except HAError:
+            log.debug("HA registry loaded: devices=%s entities=%s",
+                      len((data or {}).get("devices") or []),
+                      len((data or {}).get("entities") or []))
+        except HAError as e:
+            log.warning("HA registry unavailable: %s (%s)", e.message, e.code)
             data = None
-        except Exception:  # noqa: BLE001 注册表仅是增强信息，任何异常都降级
+        except Exception as e:  # noqa: BLE001 注册表仅是增强信息，任何异常都降级
+            log.warning("HA registry unavailable: %s", e)
             data = None
         self._registry_cache = data
         self._registry_ts = now

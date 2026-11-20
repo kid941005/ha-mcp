@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, Optional
 
@@ -16,6 +17,8 @@ from .config import (
     SERVICE_CONFIRM_TIMEOUT,
 )
 from .client import HAError, HAClient
+
+log = logging.getLogger("homeassistant_xiaozhiserver.service")
 
 SUPPORTED_ACTIONS = [
     "turn_on", "turn_off", "toggle", "open", "close", "stop", "pause", "continue", "play",
@@ -323,6 +326,10 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         "checks": check["checks"],
         "mismatches": check["mismatches"],
     }
+    log.info("action entity=%s service=%s status=%s verified=%s attempts=%s elapsed_ms=%s",
+             eid, svc_str, status, verified, attempts, verification["elapsed_ms"])
+    if status == "mismatch":
+        log.warning("action mismatch entity=%s service=%s mismatches=%s", eid, svc_str, check["mismatches"])
     return {
         "entity_id": eid, "name": name, "service": svc_str,
         "response_kind": resp_kind, "status": status,

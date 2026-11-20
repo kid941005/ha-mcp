@@ -14,7 +14,11 @@
 """
 from __future__ import annotations
 
+import functools
+import logging
 import os
+import time
+import uuid
 from typing import Any, Optional
 
 from mcp.server.mcpserver import MCPServer
@@ -47,6 +51,10 @@ from .views import (
     _group_by_device,
     _registry_maps,
 )
+from .logging_setup import reset_call_id, set_call_id, setup_logging
+
+log = logging.getLogger("homeassistant_xiaozhiserver.server")
+setup_logging()
 
 mcp = MCPServer(
     "homeassistant-xiaozhiserver",
@@ -78,7 +86,64 @@ def get_ha() -> HAClient:
     return _ha
 
 
+def _is_sensitive(key: str) -> bool:
+    k = key.lower()
+    return any(m in k for m in ("token", "password", "secret", "authorization", "cookie"))
+
+
+def _short(value: Any, limit: int = 200) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _safe_log_args(args: tuple, kwargs: dict) -> dict:
+    out: dict = {}
+    for i, v in enumerate(args):
+        out["arg" + str(i)] = _short(v)
+    for k, v in kwargs.items():
+        if _is_sensitive(str(k)):
+            out[str(k)] = "***"
+        elif isinstance(v, dict):
+            out[str(k)] = {str(kk): ("***" if _is_sensitive(str(kk)) else _short(vv, 80))
+                           for kk, vv in list(v.items())[:20]}
+        else:
+            out[str(k)] = _short(v)
+    return out
+
+
+def _log_tool(name: str):
+    """记录每次 MCP 工具调用的入参摘要、耗时与结果码；不记录令牌。"""
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            call_id = uuid.uuid4().hex[:8]
+            token = set_call_id(call_id)
+            started = time.perf_counter()
+            log.info("tool=%s start args=%s", name, _safe_log_args(args, kwargs))
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception:
+                log.exception("tool=%s exception", name)
+                raise
+            else:
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                if isinstance(result, dict) and result.get("ok") is False:
+                    log.warning("tool=%s done ok=false code=%s elapsed_ms=%s message=%s",
+                                name, result.get("code"), elapsed_ms, _short(result.get("message"), 300))
+                elif isinstance(result, dict) and result.get("status") == "mismatch":
+                    log.warning("tool=%s done status=mismatch elapsed_ms=%s entity=%s service=%s",
+                                name, elapsed_ms, result.get("entity_id"), result.get("service"))
+                else:
+                    log.info("tool=%s done ok=true elapsed_ms=%s", name, elapsed_ms)
+                return result
+            finally:
+                reset_call_id(token)
+        return wrapper
+    return deco
+
+
 @mcp.tool()
+@_log_tool("list_devices")
 async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = None,
                        controllable_only: bool = False, group_by: str = "entity",
                        limit: Optional[int] = None, offset: int = 0) -> dict:
@@ -154,6 +219,7 @@ async def list_devices(keyword: Optional[str] = None, domain: Optional[str] = No
 
 
 @mcp.tool()
+@_log_tool("get_device_state")
 async def get_device_state(entity: str, include_all_attributes: bool = False) -> dict:
     """查询单个设备的当前状态与关键属性。
 
@@ -206,6 +272,7 @@ async def get_device_state(entity: str, include_all_attributes: bool = False) ->
 
 
 @mcp.tool()
+@_log_tool("control_device")
 async def control_device(entity: str, action: str, value: Optional[Any] = None,
                          confirm_token: Optional[str] = None) -> dict:
     """控制设备（开关、亮度、音量、温度、颜色等）。
@@ -281,6 +348,7 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
 
 
 @mcp.tool()
+@_log_tool("list_services")
 async def list_services(entity: Optional[str] = None, domain: Optional[str] = None,
                         keyword: Optional[str] = None, detailed: bool = False) -> dict:
     """查询 Home Assistant 中某类设备/某个设备支持的服务（能力）及参数。
@@ -377,6 +445,7 @@ async def list_services(entity: Optional[str] = None, domain: Optional[str] = No
 
 
 @mcp.tool()
+@_log_tool("call_service")
 async def call_service(entity: str, service: str, data: Optional[dict] = None,
                       confirm_token: Optional[str] = None) -> dict:
     """通用服务调用：对任意设备执行 Home Assistant 的任意服务（覆盖 control_device 未封装的场景）。
@@ -452,6 +521,7 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
 
 
 @mcp.tool()
+@_log_tool("list_domains")
 async def list_domains() -> dict:
     """列出当前所有设备类型（domain）及其数量。
 
@@ -524,9 +594,11 @@ async def _ready(request):
     except HAError as e:
         code = 503
         info.update({"status": "error", "ha": "error", "ha_error": e.to_dict()})
+        log.warning("readiness failed: %s", e.to_dict())
     except Exception as e:  # noqa: BLE001
         code = 503
         info.update({"status": "error", "ha": "error", "ha_error": str(e)})
+        log.warning("readiness failed: %s", e)
     return JSONResponse(info, status_code=code)
 
 
@@ -537,6 +609,20 @@ def main() -> None:
         raise SystemExit(
             "无效的 MCP_TRANSPORT=" + repr(transport) + "；允许的值为：" + ", ".join(allowed)
         )
+    setup_logging()
+    log.info(
+        "startup transport=%s host=%s port=%s path=%s sse_path=%s log_level=%s",
+        transport, MCP_HOST, MCP_PORT, MCP_PATH, MCP_SSE_PATH, LOG_LEVEL,
+    )
+    log.info(
+        "HA config url=%s token=%s timeout=%ss verify_ssl=%s ws_enabled=%s ws_url=%s",
+        os.environ.get("HA_URL", "(not set)"),
+        "set" if os.environ.get("HA_TOKEN") else "missing",
+        os.environ.get("HA_TIMEOUT", "10"),
+        os.environ.get("HA_VERIFY_SSL", "true"),
+        os.environ.get("HA_WS_ENABLED", "true"),
+        os.environ.get("HA_WS_URL") or "(derived from HA_URL)",
+    )
     if transport == "stdio":
         mcp.run(transport="stdio")
         return
