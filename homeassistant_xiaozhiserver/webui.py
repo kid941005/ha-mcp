@@ -304,6 +304,7 @@ def create_app() -> FastAPI:
             "ok": True,
             "entries": read_recent_logs(limit=limit, level=level or None),
             "file": log_file_path(),
+            "version": __version__,
             "level": level or "ALL",
             "limit": limit,
         }, 200
@@ -382,7 +383,11 @@ _PAGE_STYLE = """
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;margin:0;background:#f5f6f8;color:#1f2328}
 header{background:#1f2937;color:#fff;padding:16px 24px}
 header h1{margin:0;font-size:18px;font-weight:600}
+header .brand{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+header .version{font-size:12px;font-weight:600;color:#bfdbfe;background:#374151;border:1px solid #4b5563;border-radius:999px;padding:2px 8px}
 header .sub{margin-top:4px;font-size:12px;color:#cbd5e1}
+.ver{font-size:11px;font-weight:600;color:#2563eb;background:#eff6ff;border-radius:999px;padding:1px 7px;margin-left:6px;vertical-align:middle}
+.log-ver{color:#38bdf8;margin-right:8px}
 main{max-width:1120px;margin:20px auto;padding:0 16px}
 section{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:16px}
 h2{font-size:15px;margin:0 0 12px;color:#111827}
@@ -432,7 +437,8 @@ def _page(title: str, body: str, script: str = "") -> str:
         "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>" + html.escape(title) + "</title><style>" + _PAGE_STYLE + "</style></head>"
-        "<body><header><h1>homeassistant-xiaozhiserver · WebUI</h1>"
+        "<body><header><div class='brand'><h1>homeassistant-xiaozhiserver · WebUI</h1>"
+        "<span class='version'>v" + html.escape(__version__) + "</span></div>"
         "<div class='sub'>设备总览 · 服务日志 · 高级工具调试</div></header>"
         "<main>" + body + "</main>" + script + "</body></html>"
     )
@@ -480,11 +486,14 @@ def _render_log_entries(entries: list[dict[str, str]]) -> str:
     out: list[str] = []
     for entry in entries:
         level = html.escape(str(entry.get("level") or "INFO"))
+        version = str(entry.get("version") or "")
+        version_html = ("<span class='log-ver'>v" + html.escape(version) + "</span>") if version else ""
         message = html.escape(str(entry.get("message") or "")).replace("\n", "<br>")
         out.append(
             "<div class='log-line log-" + level + "'>"
             "<span class='log-time'>" + html.escape(str(entry.get("time") or "")) + "</span>"
             "<span class='log-level'>" + level + "</span>"
+            + version_html +
             "<span class='log-name'>[" + html.escape(str(entry.get("logger") or "")) + "]</span>"
             "<span class='log-msg'>" + message + "</span>"
             "</div>"
@@ -561,7 +570,7 @@ def _render_index(status: dict[str, Any], devices: dict[str, Any],
         "<th>区域</th><th>设备</th><th>类型</th><th>实体</th><th>状态</th><th>可执行动作</th>"
         "</tr></thead><tbody id='device-body'>" + _render_device_rows(devices) + "</tbody></table>"
         "<p><small>仅列出可控制实体；危险设备（门锁、安防、车库门等）操作仍需二次确认。</small></p></section>"
-        "<section><div class='section-head'><h2>服务日志</h2>"
+        "<section><div class='section-head'><h2>服务日志<span class='ver'>v" + html.escape(__version__) + "</span></h2>"
         "<span class='muted'>WebUI 与 bridge 共享日志，最近 200 条</span></div>"
         "<div class='toolbar'>"
         "<select id='log-level'><option value='ALL'>全部级别</option><option value='INFO'>INFO</option>"

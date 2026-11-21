@@ -42,7 +42,7 @@
 | 健壮错误处理 | 所有工具返回结构化 JSON；失败给 `code` / `message` / `hint`，不抛异常堆栈、不使服务崩溃 |
 | 配置安全 | `HA_URL` / `HA_TOKEN` / `MCP_ENDPOINT` 只从环境变量读取，不写入镜像或代码 |
 | 离线可测 | 自带 fake HA 模拟器与 stdio 端到端测试，无需真实 Home Assistant 即可验证全部工具 |
-| WebUI | 随服务启动：运行状态、按区域/类型汇总的可调用设备总览、WebUI 与 bridge 共享的服务日志；高级工具调试台与运行参数折叠展示；固定 `8099`，无独立密码，直接使用 `HA_URL` / `HA_TOKEN`，敏感值仅掩码展示 |
+| WebUI | 随服务启动：运行状态、按区域/类型汇总的可调用设备总览、WebUI 与 bridge 共享的服务日志；页头、日志面板与每条日志均标注版本号；高级工具调试台与运行参数折叠展示；固定 `8099`，无独立密码，直接使用 `HA_URL` / `HA_TOKEN`，敏感值仅掩码展示 |
 
 ---
 
@@ -110,14 +110,14 @@ homeassistant-xiaozhiserver/
 | 模块 | 职责 |
 |---|---|
 | `config.py` | 集中解析环境变量；`env_str` / `env_bool` / `env_int` / `env_float` / `env_set`，非法值不会导致 import 崩溃 |
-| `logging_setup.py` | 统一日志格式（含 `call_id`）；同时写 stderr 与共享日志文件，供 WebUI 读取最近日志；单次工具调用可串联工具入口、HA 请求与动作回读 |
+| `logging_setup.py` | 统一日志格式（含 `call_id` 与版本号 `vX.Y.Z`）；同时写 stderr 与共享日志文件，供 WebUI 读取最近日志；单次工具调用可串联工具入口、HA 请求与动作回读 |
 | `client.py` | 封装 HA REST 与 WebSocket；统一 `HAError` 错误码；连接池复用；注册表 TTL 与失败短重试；DEBUG 级记录 HA 请求/响应 |
 | `service.py` | 动作 → HA 服务映射；预期状态/属性推导；控制后四态回读校验 |
 | `danger.py` | 判断危险设备；签发/消费一次性 `confirm_token`，绑定实体、服务与参数 |
 | `views.py` | 实体视图、关键属性裁剪、可控性/危险标记、按物理设备聚合 |
 | `server.py` | 六个 MCP 工具；固定 `stdio` 传输；进程入口 |
 | `mcp_pipe.py` | 连接小智 MCP 接入点，启动 stdio MCP server，双向搬运 JSON-RPC，断线自动重连 |
-| `webui.py` | WebUI（FastAPI）：运行状态、按区域/类型汇总的可调用设备、WebUI+bridge 服务日志、折叠的工具调试台与运行参数；随服务启动，固定 `0.0.0.0:8099`，无独立密码 |
+| `webui.py` | WebUI（FastAPI）：运行状态、按区域/类型汇总的可调用设备、WebUI+bridge 服务日志、折叠的工具调试台与运行参数；页头与服务日志面板显示版本号；随服务启动，固定 `0.0.0.0:8099`，无独立密码 |
 
 ---
 
@@ -241,9 +241,9 @@ docker compose logs -f homeassistant-xiaozhiserver
 
 WebUI 与 MCP bridge 在**同一个容器**内启动：WebUI 后台运行，bridge 前台运行。页面按四块组织，避免重复展示：
 
-- **运行状态**：版本、启动时间、运行时长、HA 连通性、MCP 接入点、运行形态；配置类信息不再单独重复一张表。
+- **运行状态**：版本、启动时间、运行时长、HA 连通性、MCP 接入点、运行形态；页头同时显示版本徽标，配置类信息不再单独重复一张表。
 - **可调用设备**：按区域汇总，逐行显示设备、实体、类型（灯具/开关/空调/窗帘/门锁/媒体/风扇/扫地机/传感器等）、当前状态与可执行动作；危险设备带标记，支持关键字过滤和刷新。数据来自 `list_devices(group_by="device", controllable_only=true)`。
-- **服务日志**：读取 WebUI 与 bridge 共用的日志文件，展示最近 200 条，支持级别筛选、手动刷新与 5 秒自动刷新；页面底部显示日志文件路径。
+- **服务日志**：读取 WebUI 与 bridge 共用的日志文件，展示最近 200 条，支持级别筛选、手动刷新与 5 秒自动刷新；面板标题与每条日志均标注版本号，页面底部显示日志文件路径。
 - **高级**：工具调试台与运行参数默认折叠在页面底部，需要时再展开。
 
 WebUI 固定监听 `0.0.0.0:8099`，无独立密码，直接复用 `.env` 里的 `HA_URL` / `HA_TOKEN`，不需要任何 `WEBUI_*` 环境变量。容器启动后浏览器访问 `http://<宿主机IP>:8099/`（例如 `http://192.168.50.100:8099/`）即可。
@@ -612,7 +612,7 @@ if "action" in resultJson:
    - 先确认出现 `MCP接入点连接成功` 与 `已启动 MCP server`；
    - 若一直重连，检查 `MCP_ENDPOINT` 是否为工具端 `ws://` 地址、token 是否有效、bridge 能否访问该主机/端口。
 2. **看容器状态**：`docker compose ps`。容器应保持 `Up`；反复重启通常是 `MCP_ENDPOINT` 未设置或格式错误（进程会直接退出）。
-3. **看日志（带 call_id 追踪）**：每条日志格式为 `时间 级别 logger [call_id] 消息`，`call_id` 可把一次工具调用的入口、HA 请求与回读串起来。
+3. **看日志（带 call_id 与版本追踪）**：每条日志格式为 `时间 级别 v版本 logger [call_id] 消息`，`call_id` 可把一次工具调用的入口、HA 请求与回读串起来，版本号可区分容器内实际运行的镜像版本。
    ```bash
    docker logs -f homeassistant-xiaozhiserver 2>&1 | grep -E 'tool=|action |HA registry|MCP接入点'
    docker logs homeassistant-xiaozhiserver 2>&1 | grep '<call_id>'
@@ -622,7 +622,7 @@ if "action" in resultJson:
    - `action entity=light.living_room service=light.turn_on status=confirmed verified=True attempts=1 elapsed_ms=...`
    - `tool=control_device done ok=false code=not_found ...`
    - `confirm_token` 在日志中显示为 `***`；`HA_TOKEN` 启动日志只显示 `set`/`missing`。
-   - 同一份日志也可在 WebUI 的“服务日志”区查看（支持级别筛选与 5 秒自动刷新），无需反复执行 `docker logs`。
+   - 同一份日志也可在 WebUI 的“服务日志”区查看（支持级别筛选与 5 秒自动刷新，面板与每条日志显示版本号），无需反复执行 `docker logs`。
 4. **单独验证 HA**（排除本服务问题）：
    ```bash
    curl -s -H "Authorization: Bearer <你的令牌>" https://your-ha.example:8123/api/states | head -c 300
@@ -654,7 +654,7 @@ export TEST_TOKEN=任意本地测试口令
 bash tests/run_local_test.sh
 ```
 
-脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 无需登录即可访问、状态、配置掩码、设备总览（`/api/devices`）、服务日志（`/api/logs`）与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
+脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 无需登录即可访问、状态、配置掩码、设备总览（`/api/devices`）、服务日志（`/api/logs`，含版本号）与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
 
 也可分两个终端手动运行：
 
@@ -702,7 +702,7 @@ python tests/e2e_mcp_client.py
 | 版本 | 主要变化 |
 |---|---|
 | v1.13.0 | 简化部署：WebUI 与 MCP bridge 合并为单容器（`docker-entrypoint.sh` 同时启动两进程）；WebUI 去掉独立密码与全部 `WEBUI_*` 环境变量，固定监听 `0.0.0.0:8099`，直接复用 `HA_URL` / `HA_TOKEN`；compose 收敛为单服务；冒烟测试改为无需登录 |
-| v1.13.1 | 控制结果改为 `action=RESPONSE` + 中文 `response`，修复小智把 `turn_off` 当 `Action` 枚举导致播报“turn off”的问题，并省掉控制后的一次 LLM 往返；`call_service` 常见控制服务同样直接播报；WebUI 去重运行状态/配置、新增按区域与类型展示的可调用设备列表、新增 WebUI+bridge 共享日志面板 |
+| v1.13.1 | 控制结果改为 `action=RESPONSE` + 中文 `response`，修复小智把 `turn_off` 当 `Action` 枚举导致播报“turn off”的问题，并省掉控制后的一次 LLM 往返；`call_service` 常见控制服务同样直接播报；WebUI 去重运行状态/配置、新增按区域与类型展示的可调用设备列表、新增 WebUI+bridge 共享日志面板；WebUI 页头、日志面板与每条日志显示版本号 |
 | v1.12.0 | 新增可选 WebUI（默认关闭）：状态页、六工具调试台、配置只读；FastAPI + 服务端渲染，无前端构建；独立 compose profile，不改变 bridge 出站拓扑；新增 `tests/webui_smoke.py` |
 | v1.11.1 | 修复 `list_devices` 无过滤时忽略 `DEFAULT_LIST_LIMIT`、固定按 20 条分页的问题（现按配置通常 50 条）；默认提示动态显示条数，`has_more=true` 时提示用 `keyword`/`area` 精确过滤；回归测试增加 `applied_limit_gt: 20` 断言，防止再次退化 |
 | v1.11.0 | `list_devices` 易用性与防误用：支持 `query`/`q`/`search`/`name` 关键字别名；未知参数返回 `invalid_argument` 并列出可用参数（不再静默忽略）；无过滤条件时默认 `controllable_only=true` 且每页 20 条；工具描述内置「点名设备直接 control_device」硬约束 |

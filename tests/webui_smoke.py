@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from homeassistant_xiaozhiserver import __version__  # noqa: E402
 from homeassistant_xiaozhiserver.webui import create_app  # noqa: E402
 
 client = TestClient(create_app())
@@ -33,6 +34,7 @@ check("无需登录访问首页 200", r.status_code == 200, str(r.status_code))
 check("首页包含运行状态", "运行状态" in r.text)
 check("首页包含可调用设备", "可调用设备" in r.text)
 check("首页包含服务日志", "服务日志" in r.text)
+check("首页含版本号", ("v" + __version__) in r.text, __version__)
 check("首页包含折叠的工具调试台", "高级：工具调试台" in r.text)
 check("首页不再重复展示只读配置表", "配置（只读" not in r.text)
 
@@ -50,6 +52,10 @@ check("无需登录访问 /api/logs 200", r.status_code == 200, str(r.status_cod
 logs = r.json()
 check("logs 返回 entries 列表", isinstance(logs.get("entries"), list), str(type(logs.get("entries"))))
 check("logs 返回日志文件路径", isinstance(logs.get("file"), str) and bool(logs.get("file")))
+check("logs 含版本号", logs.get("version") == __version__, str(logs.get("version")))
+entries = logs.get("entries") or []
+check("日志条目带版本字段", all("version" in e for e in entries))
+check("新日志条目含版本号", any(e.get("version") for e in entries))
 r = client.get("/api/logs?limit=abc")
 check("logs 非法 limit 返回 400", r.status_code == 400, str(r.status_code))
 r = client.get("/api/logs?level=NOT_A_LEVEL")

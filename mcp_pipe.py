@@ -30,7 +30,12 @@ except Exception:  # pragma: no cover - 独立运行时退回基础配置
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+try:
+    from homeassistant_xiaozhiserver import __version__ as _bridge_version
+except Exception:  # pragma: no cover - 独立运行时无包
+    _bridge_version = "unknown"
 logger = logging.getLogger("MCP_PIPE")
+logger.info("bridge version=%s", _bridge_version)
 
 INITIAL_BACKOFF = 1
 MAX_BACKOFF = 600

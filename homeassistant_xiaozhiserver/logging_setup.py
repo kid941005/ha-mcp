@@ -16,17 +16,25 @@ import sys
 import tempfile
 from logging.handlers import WatchedFileHandler
 
+from . import __version__
 from .config import LOG_FILE, LOG_LEVEL
 
 _CALL_ID = contextvars.ContextVar("call_id", default="-")
+_VERSION_LOGGED = False
 _LINE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\w+)\s+(\S+) \[([^\]]*)\] (.*)$"
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (\w+)\s+(?:v(\d+\.\d+\.\d+\S*)\s+)?(\S+) \[([^\]]*)\] (.*)$"
 )
 
 
 class _CallIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.call_id = _CALL_ID.get()
+        return True
+
+
+class _VersionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.version = __version__
         return True
 
 
@@ -37,7 +45,7 @@ def log_file_path() -> str:
 
 def _formatter() -> logging.Formatter:
     return logging.Formatter(
-        "%(asctime)s %(levelname)-5s %(name)s [%(call_id)s] %(message)s",
+        "%(asctime)s %(levelname)-5s v%(version)s %(name)s [%(call_id)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -53,6 +61,7 @@ def setup_logging() -> None:
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_formatter())
         handler.addFilter(_CallIdFilter())
+        handler.addFilter(_VersionFilter())
         handler._homeassistant_xiaozhiserver = True  # type: ignore[attr-defined]
         root.addHandler(handler)
 
@@ -75,8 +84,14 @@ def setup_logging() -> None:
             return
         handler.setFormatter(_formatter())
         handler.addFilter(_CallIdFilter())
+        handler.addFilter(_VersionFilter())
         handler._homeassistant_xiaozhiserver_file = True  # type: ignore[attr-defined]
         root.addHandler(handler)
+
+    global _VERSION_LOGGED
+    if not _VERSION_LOGGED:
+        logging.getLogger("homeassistant_xiaozhiserver").info("version=%s", __version__)
+        _VERSION_LOGGED = True
 
 
 def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[str, str]]:
@@ -107,9 +122,10 @@ def read_recent_logs(limit: int = 200, level: str | None = None) -> list[dict[st
             entries.append({
                 "time": match.group(1),
                 "level": match.group(2).upper(),
-                "logger": match.group(3),
-                "call_id": match.group(4),
-                "message": match.group(5),
+                "version": match.group(3) or "",
+                "logger": match.group(4),
+                "call_id": match.group(5),
+                "message": match.group(6),
             })
         elif entries and line:
             entries[-1]["message"] += "\n" + line
