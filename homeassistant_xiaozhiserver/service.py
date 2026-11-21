@@ -58,6 +58,139 @@ def _friendly_name(st: dict) -> str:
     return str((st.get("attributes") or {}).get("friendly_name") or st.get("entity_id"))
 
 
+# 对外播报用的中文标签：不要把 turn_off / light.turn_on / off 这类协议词暴露给语音助手。
+_ACTION_LABELS = {
+    "turn_on": "打开", "turn_off": "关闭", "toggle": "切换",
+    "open": "打开", "close": "关闭", "stop": "停止", "pause": "暂停",
+    "continue": "继续", "resume": "继续", "play": "播放",
+    "set_brightness": "调亮度", "set_volume": "调音量", "volume_set": "调音量",
+    "set_percentage": "调风速", "set_speed": "调风速",
+    "volume_mute": "静音", "volume_unmute": "取消静音",
+    "set_temperature": "调温", "set_color_temp": "调色温", "set_color": "调颜色",
+    "lock": "上锁", "unlock": "解锁", "set_hvac_mode": "切换模式",
+    "set_fan_mode": "调风速", "set_swing_mode": "调摆风", "set_preset_mode": "调模式",
+    "set_humidity": "调湿度", "set_position": "调位置", "set_cover_position": "调位置",
+    "media_play": "播放", "media_pause": "暂停", "media_stop": "停止",
+    "open_cover": "打开", "close_cover": "关闭", "stop_cover": "停止",
+}
+
+# 这些服务名可以直接生成中文播报；call_service 只对可控 domain 使用，避免把脚本/场景说成设备动作。
+DIRECT_RESPONSE_SERVICES = frozenset(_ACTION_LABELS) | {"set_hvac_mode"}
+
+_STATE_LABELS = {
+    "on": "打开", "off": "关闭", "open": "打开", "closed": "关闭",
+    "locked": "上锁", "unlocked": "解锁", "playing": "播放",
+    "paused": "暂停", "idle": "待机", "standby": "待机",
+    "heat": "制热", "cool": "制冷", "auto": "自动", "dry": "除湿",
+    "fan_only": "送风", "unavailable": "不可用", "unknown": "未知",
+}
+
+
+def _action_label(action: Any) -> str:
+    """把 turn_off / light.turn_on 之类的协议名转成中文动作。"""
+    s = str(action or "").strip().lower()
+    if "." in s:
+        s = s.split(".", 1)[1]
+    return _ACTION_LABELS.get(s, "执行" if s else "操作")
+
+
+def _state_label(state: Any) -> str:
+    s = str(state or "").strip().lower()
+    return _STATE_LABELS.get(s, "目标状态" if s else "未知")
+
+
+def _num_text(value: Any, scale: float = 1.0) -> str:
+    """把数值格式化成短文本；非法值返回空串，避免播报阶段抛异常。"""
+    try:
+        v = float(value) * scale
+    except (TypeError, ValueError):
+        return ""
+    return ("%g" % v)
+
+
+def _voice_message(name: str, action: str, status: str, after: Optional[dict],
+                   verified: bool, payload: Optional[dict]) -> str:
+    """生成适合 TTS 直接播报的中文短句，不包含服务名、entity_id 或英文状态。"""
+    label = _action_label(action)
+    state = (after or {}).get("state")
+    p = payload if isinstance(payload, dict) else {}
+    if status == "confirmed":
+        if label == "切换":
+            if state in ("on", "off"):
+                return name + "已" + _state_label(state) + "。"
+            return name + "已切换。"
+        if label == "调亮度":
+            v = _num_text(p.get("brightness_pct"))
+            if v:
+                return name + "亮度已调到" + v + "%。"
+        if label == "切换模式":
+            mode = p.get("hvac_mode")
+            if mode:
+                return name + "已切换到" + _state_label(mode) + "模式。"
+            return name + "模式已切换。"
+        if label == "调风速":
+            v = _num_text(p.get("percentage"))
+            if v:
+                return name + "风速已调到" + v + "%。"
+            return name + "风速已调整。"
+        if label == "调摆风":
+            return name + "摆风已调整。"
+        if label == "调模式":
+            return name + "模式已切换。"
+        if label == "调湿度":
+            v = _num_text(p.get("humidity"))
+            if v:
+                return name + "湿度已调到" + v + "%。"
+            return name + "湿度已调整。"
+        if label == "调位置":
+            v = _num_text(p.get("position"))
+            if v:
+                return name + "位置已调到" + v + "%。"
+            return name + "位置已调整。"
+        if label == "调音量":
+            v = _num_text(p.get("volume_level"), 100)
+            if v:
+                return name + "音量已调到" + v + "%。"
+        if label == "调温":
+            v = _num_text(p.get("temperature"))
+            if v:
+                return name + "温度已调到" + v + "度。"
+        if label == "调色温":
+            v = _num_text(p.get("color_temp_kelvin"))
+            if v:
+                return name + "色温已调到" + v + "K。"
+        if label == "调颜色":
+            return name + "颜色已调整。"
+        if label == "静音":
+            return name + "已静音。"
+        if label == "取消静音":
+            return name + "已取消静音。"
+        if label == "继续":
+            return name + "已继续播放。"
+        if label == "播放":
+            return name + "已开始播放。"
+        if label == "暂停":
+            return name + "已暂停。"
+        if label == "停止":
+            return name + "已停止。"
+        if label == "上锁":
+            return name + "已上锁。"
+        if label == "解锁":
+            return name + "已解锁。"
+        return name + "已" + label + "。"
+    if status == "no_change":
+        if verified:
+            if state == "on":
+                return name + "本来就是开着的，不用操作。"
+            if state == "off":
+                return name + "本来就是关着的，不用操作。"
+            return name + "本来就是" + _state_label(state) + "，不用操作。"
+        return name + "没有变化，可能不支持这个操作。"
+    if status == "mismatch":
+        return name + "已执行，但状态没达到预期。"
+    return name + "的指令已发送，稍后再确认。"
+
+
 def snapshot(st: Optional[dict]) -> Optional[dict]:
     if not st:
         return None
@@ -301,33 +434,17 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
 
     svc_str = service_domain + "." + service
     name = _friendly_name(st)
-    msg = "已对 " + name + " 执行 " + str(action_label) + "（服务 " + svc_str + "）"
-    if after is not None:
-        msg += "，当前状态：" + str(after.get("state"))
-    if status == "confirmed":
-        if has_expectation:
-            msg += "。已回读确认达到预期（" + str(attempts) + " 次）"
-        else:
-            msg += "。已回读确认状态发生变化（" + str(attempts) + " 次；该服务无明确预期，按变化确认）"
-    elif status == "mismatch":
-        detail = "；".join(
-            str(m.get("field")) + " 期望 " + str(m.get("expected")) + "，实际 " + str(m.get("actual"))
-            for m in check["mismatches"]
-        )
-        msg += "。已观察到变化，但与预期不符：" + detail + "（回读 " + str(attempts) + " 次）。请检查设备能力或参数。"
-    elif status == "no_change":
-        if verified:
-            msg += "。回读确认设备已处于目标状态（" + str(attempts) + " 次）"
-        else:
-            msg += "。注意：HA 已接受调用，但回读未见状态变化——设备可能不支持该操作或当前已是目标状态。"
-    else:  # accepted_pending
+    voice = _voice_message(name, action_label, status, after, verified, payload)
+    msg = voice
+    if status == "mismatch":
+        msg += "请检查设备能力或参数。"
+    elif status == "no_change" and not verified:
+        msg += "HA 已接受调用，但回读未见状态变化。"
+    elif status == "accepted_pending":
         if readback_errors and after is None:
-            msg += "。HA 已接受调用，但回读状态失败（" + "、".join(readback_errors) + "），无法确认结果；请稍后用 get_device_state 复查。"
+            msg += "HA 已接受调用，但回读状态失败（" + "、".join(readback_errors) + "），请稍后复查。"
         else:
-            msg += "。HA 未返回调用结果（新版 HA 常见），已下发但回读 " + str(attempts) + " 次仍未完全匹配预期"
-            if expected:
-                msg += "（预期状态：" + expected + "）"
-            msg += "；若稍后仍未变化，可用 get_device_state 复查。"
+            msg += "HA 未返回调用结果，已下发但回读 " + str(attempts) + " 次仍未完全匹配预期，请稍后复查。"
 
     verification = {
         "verified": verified,
@@ -348,7 +465,7 @@ async def _apply_and_confirm(ha: "HAClient", st: dict, service_domain: str,
         "expected_state": expected, "before": before, "after": after,
         "changed": changed, "verified": verified,
         "readback_errors": readback_errors,
-        "verification": verification, "message": msg,
+        "verification": verification, "message": msg, "voice": voice,
     }
 
 

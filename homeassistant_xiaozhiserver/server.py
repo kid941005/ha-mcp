@@ -28,6 +28,7 @@ from .config import DEFAULT_LIST_LIMIT, LOG_LEVEL, MAX_LIST_LIMIT
 from .client import HAError, HAClient
 from .danger import _danger_block, _danger_flags
 from .service import (
+    DIRECT_RESPONSE_SERVICES,
     DOMAIN_ACTIONS,
     _apply_and_confirm,
     _domain_of,
@@ -58,8 +59,9 @@ mcp = MCPServer(
         "查看单个设备状态用 get_device_state（entity 可传 entity_id 或中文名称；"
         "默认只返回关键属性，include_all_attributes=true 可返回完整属性）；"
         "查询某类设备支持哪些服务与参数用 list_services；"
-        "常规控制用 control_device（action 见工具描述，value 用于亮度/音量/温度等，"
-        "控制后自动回读校验状态与属性）；"
+        "常规控制直接用 control_device 并传用户说的设备名称，不要先 list_devices；"
+        "只有名称不明确、需要确认设备能力或设备不存在时才查列表/服务（action 见工具描述，"
+        "value 用于亮度/音量/温度等，控制后自动回读校验状态与属性）；"
         "对 lock、alarm_control_panel 以及车库门/门窗类 cover 等危险设备的操作会先返回 "
         "confirmation_required 与 confirm_token；必须让用户明确确认后，带 confirm_token 再调用一次；"
         "需要执行上述未覆盖的任意 HA 服务时用 call_service（服务名 + 参数 JSON）；"
@@ -465,6 +467,7 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
     返回 verified 与 verification（attempts/checks/mismatches/elapsed_ms）。
     若 HA 接受调用但未达预期会明确返回 mismatch 或 no_change，避免静默假成功。
     适用场景：「把客厅灯亮度调到 50」「关掉风扇」「空调设到 26 度」「电视音量 30」。
+    设备名称能直接匹配时不需要先调 list_devices；只有名称不明确或设备不存在时才先查询。
     """
     try:
         ha = get_ha()
@@ -504,7 +507,13 @@ async def control_device(entity: str, action: str, value: Optional[Any] = None,
             return guard
         result = await _apply_and_confirm(ha, st, sd, svc, payload, action_name)
         result["ok"] = True
-        result["action"] = action_name
+        # 注意：xiaozhi MCP 接入点把结果里的 action 当作 Action 枚举名解析；
+        # turn_off / turn_on 不是合法枚举，会被转成 Action.ERROR 并把 "turn_off" 直接 TTS。
+        # 因此设备动作放在 device_action，成功时用 action=RESPONSE + 中文 response 让助手直接播报，
+        # 省掉一次 LLM 往返；确认/错误分支不返回 action，仍交给 LLM 处理。
+        result["device_action"] = action_name
+        result["action"] = "RESPONSE"
+        result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
         return result
     except HAError as e:
         return {"ok": False, **e.to_dict(), "hint": "可先用 list_devices / get_device_state 确认设备与能力后重试。"}
@@ -675,6 +684,10 @@ async def call_service(entity: str, service: str, data: Optional[dict] = None,
             return guard
         result = await _apply_and_confirm(ha, st, service_domain, svc, payload, spec)
         result["ok"] = True
+        result["device_action"] = svc
+        if service_domain in DOMAIN_ACTIONS and svc in DIRECT_RESPONSE_SERVICES:
+            result["action"] = "RESPONSE"
+            result["response"] = result.get("voice") or result.get("message") or "操作已完成。"
         return result
     except HAError as e:
         out = {"ok": False, **e.to_dict()}

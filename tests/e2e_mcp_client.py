@@ -71,6 +71,19 @@ def verify_case(index, name, args, r, expected):
     if "service" in expected:
         check(d.get("service") == expected["service"], label + " service",
               d.get("service"))
+    if "action" in expected:
+        check(d.get("action") == expected["action"], label + " action", d.get("action"))
+    if "device_action" in expected:
+        check(d.get("device_action") == expected["device_action"],
+              label + " device_action", d.get("device_action"))
+    if "response_contains" in expected:
+        resp = str(d.get("response") or "")
+        check(expected["response_contains"] in resp,
+              label + " response contains " + expected["response_contains"], resp)
+    if "response_not_contains" in expected:
+        resp = str(d.get("response") or "")
+        check(expected["response_not_contains"] not in resp,
+              label + " response not contains " + expected["response_not_contains"], resp)
     if "entity_state" in expected:
         check((d.get("entity") or {}).get("state") == expected["entity_state"],
               label + " entity.state", (d.get("entity") or {}).get("state"))
@@ -187,9 +200,17 @@ async def main():
              {"ok": True, "attributes_truncated": False}),
             # 常用控制
             ("control_device", {"entity": "客厅灯", "action": "set_brightness", "value": 50},
-             {"ok": True, "status": "confirmed", "after_brightness": 127}),
+             {"ok": True, "status": "confirmed", "after_brightness": 127,
+              "action": "RESPONSE", "device_action": "set_brightness",
+              "response_contains": "亮度", "response_not_contains": "turn_off"}),
             ("control_device", {"entity": "switch.fan", "action": "turn_on"},
-             {"ok": True, "status": "confirmed", "after_state": "on"}),
+             {"ok": True, "status": "confirmed", "after_state": "on",
+              "action": "RESPONSE", "device_action": "turn_on",
+              "response_contains": "已打开"}),
+            ("control_device", {"entity": "switch.fan", "action": "turn_off"},
+             {"ok": True, "status": "confirmed", "after_state": "off",
+              "action": "RESPONSE", "device_action": "turn_off",
+              "response_contains": "已关闭", "response_not_contains": "turn_off"}),
             ("control_device", {"entity": "空调", "action": "set_temperature", "value": 26},
              {"ok": True}),
             ("control_device", {"entity": "窗帘", "action": "turn_on"},
@@ -212,9 +233,15 @@ async def main():
             # 通用服务调用
             ("call_service", {"entity": "客厅灯", "service": "light.turn_on",
                               "data": {"brightness_pct": 50}}, {"ok": True}),
-            ("call_service", {"entity": "switch.fan", "service": "turn_off"}, {"ok": True}),
+            ("call_service", {"entity": "switch.fan", "service": "switch.turn_on"},
+             {"ok": True, "action": "RESPONSE", "device_action": "turn_on",
+              "response_contains": "已打开", "response_not_contains": "turn_on"}),
             ("call_service", {"entity": "switch.fan", "service": "turn_off"},
-             {"ok": True, "status": "no_change"}),
+             {"ok": True, "action": "RESPONSE", "device_action": "turn_off",
+              "response_contains": "已关闭", "response_not_contains": "turn_off"}),
+            ("call_service", {"entity": "switch.fan", "service": "turn_off"},
+             {"ok": True, "status": "no_change", "action": "RESPONSE",
+              "response_contains": "本来就是关着"}),
             ("call_service", {"entity": "switch.fan", "service": "silent"},
              {"ok": True, "status": "accepted_pending"}),
             ("call_service", {"entity": "不存在设备", "service": "turn_on"},
@@ -250,6 +277,7 @@ async def main():
         check(d1.get("code") == "confirmation_required", "P3 首次 confirmation_required", d1.get("code"))
         check(d1.get("dangerous") is True, "P3 首次 dangerous=true", d1.get("dangerous"))
         check(bool(token), "P3 首次返回 confirm_token", token)
+        check("action" not in d1, "P3 确认分支不带 action", d1.get("action"))
         second = await call(session, "control_device", {"entity": "大门门锁", "action": "unlock",
                                                        "confirm_token": token})
         d2 = second["data"] if isinstance(second["data"], dict) else {}
@@ -257,6 +285,10 @@ async def main():
               "P3 带 token 执行成功", d2)
         check((d2.get("after") or {}).get("state") == "unlocked",
               "P3 门锁已解锁", d2.get("after"))
+        check(d2.get("action") == "RESPONSE" and d2.get("device_action") == "unlock",
+              "P3 成功控制走 RESPONSE", {"action": d2.get("action"), "device_action": d2.get("device_action")})
+        check("已解锁" in str(d2.get("response") or "") and "unlock" not in str(d2.get("response") or ""),
+              "P3 播报为中文且不含协议名", d2.get("response"))
         reuse = await call(session, "control_device", {"entity": "大门门锁", "action": "unlock",
                                                       "confirm_token": token})
         d3 = reuse["data"] if isinstance(reuse["data"], dict) else {}
