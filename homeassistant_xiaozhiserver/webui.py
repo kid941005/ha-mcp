@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WebUI：状态查看、工具调试台、配置只读。
+"""WebUI：设备总览、运行状态、服务日志、高级工具调试。
 
 直接使用 .env 中的 HA_URL / HA_TOKEN 连接 Home Assistant，不再设置独立 WebUI 密码：
     python -m homeassistant_xiaozhiserver.webui
@@ -7,7 +7,8 @@
 安全约定：
 - WebUI 无独立登录口令，请只绑定可信内网，不要直接暴露公网；
 - HA_TOKEN、MCP_ENDPOINT 的令牌只做掩码展示，绝不回传明文；
-- 工具名白名单，只允许调用 server.py 暴露的六个工具。
+- 工具名白名单，只允许调用 server.py 暴露的六个工具；
+- 日志来自共享日志文件，包含 WebUI 与 MCP bridge 两个进程。
 """
 from __future__ import annotations
 
@@ -27,9 +28,9 @@ from . import __version__
 from . import server as mcp_server
 from .client import HAError
 from .config import DEFAULT_LIST_LIMIT, LOG_LEVEL, MAX_LIST_LIMIT
-from .logging_setup import setup_logging
+from .logging_setup import log_file_path, read_recent_logs, setup_logging
 
-log = logging.getLogger("homeassistant-xiaozhiserver.webui")
+log = logging.getLogger("homeassistant_xiaozhiserver.webui")
 
 _STARTED_AT = time.time()
 WEBUI_HOST = "0.0.0.0"
@@ -49,6 +50,52 @@ _TOOL_FUNCS = {
     for name, _, _ in _TOOLS
     if hasattr(mcp_server, name)
 }
+
+_DOMAIN_LABELS = {
+    "light": "灯具",
+    "switch": "开关",
+    "climate": "空调",
+    "cover": "窗帘/门",
+    "lock": "门锁",
+    "media_player": "媒体",
+    "fan": "风扇",
+    "vacuum": "扫地机",
+    "sensor": "传感器",
+    "binary_sensor": "传感器",
+    "scene": "场景",
+    "script": "脚本",
+    "automation": "自动化",
+    "camera": "摄像头",
+    "humidifier": "加湿器",
+    "water_heater": "热水器",
+    "alarm_control_panel": "安防",
+    "button": "按钮",
+    "number": "数值",
+    "select": "选择",
+    "input_boolean": "虚拟开关",
+    "input_number": "虚拟数值",
+    "input_select": "虚拟选择",
+    "person": "人员",
+    "device_tracker": "定位",
+    "sun": "太阳",
+    "weather": "天气",
+    "update": "更新",
+    "remote": "遥控",
+    "siren": "警报",
+    "valve": "阀门",
+    "lawn_mower": "割草机",
+    "todo": "待办",
+    "calendar": "日历",
+}
+
+
+def _env(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    return raw.strip() if raw is not None and raw.strip() else default
+
+
+def _domain_label(domain: str) -> str:
+    return _DOMAIN_LABELS.get((domain or "").lower(), domain or "未知")
 
 
 def _mask_secret(value: str) -> str:
@@ -89,8 +136,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title="homeassistant-xiaozhiserver WebUI", docs_url=None, redoc_url=None, openapi_url=None)
 
     async def _status_data() -> dict[str, Any]:
-        ha_url = os.environ.get("HA_URL", "")
-        ha_token = os.environ.get("HA_TOKEN", "")
+        ha_url = _env("HA_URL")
+        ha_token = _env("HA_TOKEN")
         configured = bool(ha_url and ha_token)
         reachable: bool | None = None
         error: str | None = None
@@ -119,8 +166,8 @@ def create_app() -> FastAPI:
                 "error": error,
             },
             "mcp_endpoint": {
-                "configured": bool(os.environ.get("MCP_ENDPOINT")),
-                "display": _mask_endpoint(os.environ.get("MCP_ENDPOINT", "")),
+                "configured": bool(_env("MCP_ENDPOINT")),
+                "display": _mask_endpoint(_env("MCP_ENDPOINT")),
             },
             "tools": [
                 {"name": name, "description": desc, "example": example}
@@ -150,9 +197,122 @@ def create_app() -> FastAPI:
             "note": "配置为只读；WebUI 无独立密码，直接使用 HA_URL / HA_TOKEN 连接 HA；修改请更新 .env 并重启服务。",
         }
 
+    async def _devices_data() -> dict[str, Any]:
+        """按物理设备聚合可控实体，供首页设备总览使用。"""
+        if not (_env("HA_URL") and _env("HA_TOKEN")):
+            return {
+                "ok": False,
+                "code": "config_missing",
+                "message": "未配置 HA_URL/HA_TOKEN，无法加载设备。",
+                "rows": [],
+                "total": 0,
+                "truncated": False,
+            }
+        try:
+            result = await asyncio.wait_for(
+                mcp_server.list_devices(
+                    group_by="device",
+                    controllable_only=True,
+                    limit=MAX_LIST_LIMIT,
+                ),
+                timeout=6.0,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "code": "timeout",
+                "message": "加载设备超时（Home Assistant 响应过慢）。",
+                "rows": [],
+                "total": 0,
+                "truncated": False,
+            }
+        except HAError as exc:
+            return {
+                "ok": False,
+                "code": exc.code,
+                "message": "加载设备失败：" + exc.message,
+                "rows": [],
+                "total": 0,
+                "truncated": False,
+            }
+        except Exception:  # noqa: BLE001
+            log.exception("webui load devices failed")
+            return {
+                "ok": False,
+                "code": "internal_error",
+                "message": "加载设备失败，详见服务端日志。",
+                "rows": [],
+                "total": 0,
+                "truncated": False,
+            }
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "code": result.get("code", "error"),
+                "message": str(result.get("message") or "加载设备失败。"),
+                "rows": [],
+                "total": 0,
+                "truncated": False,
+            }
+
+        rows: list[dict[str, Any]] = []
+        for group in result.get("devices") or []:
+            if not isinstance(group, dict):
+                continue
+            group_area = str(group.get("area_name") or "")
+            group_device = str(group.get("name") or "")
+            for entity in group.get("entities") or []:
+                if not isinstance(entity, dict):
+                    continue
+                actions = entity.get("actions") or []
+                if not isinstance(actions, (list, tuple)):
+                    actions = [actions]
+                rows.append({
+                    "area": str(entity.get("area_name") or group_area or "未分配区域"),
+                    "device": str(entity.get("device_name") or group_device or "未命名设备"),
+                    "name": str(entity.get("name") or entity.get("entity_id") or ""),
+                    "entity_id": str(entity.get("entity_id") or ""),
+                    "domain": str(entity.get("domain") or ""),
+                    "type": _domain_label(str(entity.get("domain") or "")),
+                    "state": str(entity.get("state") or "unknown"),
+                    "unit": str(entity.get("unit") or ""),
+                    "actions": [str(a) for a in actions],
+                    "dangerous": bool(entity.get("dangerous")),
+                })
+        rows.sort(key=lambda item: (item["area"], item["type"], item["name"], item["entity_id"]))
+        return {
+            "ok": True,
+            "rows": rows,
+            "total": len(rows),
+            "truncated": bool(result.get("has_more")),
+            "message": str(result.get("message") or ""),
+        }
+
+    def _logs_data(limit_raw: str, level_raw: str) -> tuple[dict[str, Any], int]:
+        try:
+            limit = int(limit_raw) if str(limit_raw).strip() else 200
+        except (TypeError, ValueError):
+            return {"ok": False, "code": "invalid_argument", "message": "limit 必须是整数。"}, 400
+        if limit < 1 or limit > 500:
+            return {"ok": False, "code": "invalid_argument", "message": "limit 必须在 1 到 500 之间。"}, 400
+        level = (level_raw or "").strip().upper()
+        if level == "ALL":
+            level = ""
+        if level and level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            return {"ok": False, "code": "invalid_argument", "message": "level 不合法。"}, 400
+        return {
+            "ok": True,
+            "entries": read_recent_logs(limit=limit, level=level or None),
+            "file": log_file_path(),
+            "level": level or "ALL",
+            "limit": limit,
+        }, 200
+
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
-        return HTMLResponse(_render_index(await _status_data(), _config_data()))
+        status, devices = await asyncio.gather(_status_data(), _devices_data())
+        logs = read_recent_logs(limit=200)
+        return HTMLResponse(_render_index(status, devices, logs, _config_data()))
 
     @app.get("/api/status")
     async def api_status() -> JSONResponse:
@@ -161,6 +321,15 @@ def create_app() -> FastAPI:
     @app.get("/api/config")
     async def api_config() -> JSONResponse:
         return JSONResponse(_config_data())
+
+    @app.get("/api/devices")
+    async def api_devices() -> JSONResponse:
+        return JSONResponse(await _devices_data())
+
+    @app.get("/api/logs")
+    async def api_logs(limit: str = "200", level: str = "") -> JSONResponse:
+        data, status_code = _logs_data(limit, level)
+        return JSONResponse(data, status_code=status_code)
 
     @app.post("/tool", response_class=HTMLResponse)
     async def run_tool_form(request: Request) -> HTMLResponse:
@@ -213,82 +382,206 @@ _PAGE_STYLE = """
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;margin:0;background:#f5f6f8;color:#1f2328}
 header{background:#1f2937;color:#fff;padding:16px 24px}
 header h1{margin:0;font-size:18px;font-weight:600}
-main{max-width:1040px;margin:20px auto;padding:0 16px}
+header .sub{margin-top:4px;font-size:12px;color:#cbd5e1}
+main{max-width:1120px;margin:20px auto;padding:0 16px}
 section{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px 20px;margin-bottom:16px}
 h2{font-size:15px;margin:0 0 12px;color:#111827}
+.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
+.section-head h2{margin:0}
 table{border-collapse:collapse;width:100%;font-size:14px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #eef0f3;vertical-align:top}
-th{width:220px;color:#4b5563;font-weight:500}
+table.kv th{width:150px;color:#4b5563;font-weight:500}
+table.device-table th{color:#4b5563;font-weight:500;white-space:nowrap}
+table.device-table td{font-size:13px}
 code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace;font-size:13px}
 pre{background:#0f172a;color:#e2e8f0;padding:14px;border-radius:6px;overflow:auto;max-height:520px}
 .ok{color:#047857;font-weight:600}.bad{color:#b91c1c;font-weight:600}.muted{color:#6b7280}
+.badge{display:inline-block;padding:1px 7px;margin:1px 4px 1px 0;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;white-space:nowrap}
+.badge.danger{background:#fee2e2;color:#991b1b}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.toolbar input[type=text]{flex:1;min-width:220px;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font:inherit}
+.toolbar select,.toolbar button{font:inherit;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px}
+.toolbar button{background:#2563eb;color:#fff;border:0;cursor:pointer;width:auto}
+.toolbar button:hover{background:#1d4ed8}
+.toolbar label.auto{display:inline-flex;align-items:center;gap:5px;font-size:13px;color:#4b5563}
+.log-box{background:#0f172a;color:#e2e8f0;border-radius:6px;padding:10px 12px;max-height:360px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace;font-size:12px;line-height:1.55}
+.log-line{white-space:pre-wrap;word-break:break-word;padding:1px 0}
+.log-time{color:#94a3b8;margin-right:10px}
+.log-level{display:inline-block;min-width:58px;margin-right:8px;font-weight:600}
+.log-name{color:#64748b;margin-right:8px}
+.log-DEBUG .log-level{color:#94a3b8}
+.log-INFO .log-level{color:#93c5fd}
+.log-WARNING .log-level{color:#fbbf24}
+.log-ERROR .log-level,.log-CRITICAL .log-level{color:#f87171}
+details.advanced,details.params{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:14px 20px;margin-bottom:16px}
+details.params{margin-top:-6px}
+details summary{cursor:pointer;font-weight:600;color:#111827}
+details[open] summary{margin-bottom:12px}
 form{display:grid;gap:10px}
 select,textarea,button{font:inherit;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px}
 textarea{min-height:120px;font-family:ui-monospace,Consolas,monospace}
 button{background:#2563eb;color:#fff;border:0;cursor:pointer;width:120px}
 button:hover{background:#1d4ed8}
 small{color:#6b7280}
+@media (max-width:760px){table.device-table th:nth-child(2),table.device-table td:nth-child(2){display:none}}
 """
 
 
-def _page(title: str, body: str) -> str:
+def _page(title: str, body: str, script: str = "") -> str:
     return (
         "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>" + html.escape(title) + "</title><style>" + _PAGE_STYLE + "</style></head>"
-        "<body><header><h1>homeassistant-xiaozhiserver · WebUI</h1></header>"
-        "<main>" + body + "</main></body></html>"
+        "<body><header><h1>homeassistant-xiaozhiserver · WebUI</h1>"
+        "<div class='sub'>设备总览 · 服务日志 · 高级工具调试</div></header>"
+        "<main>" + body + "</main>" + script + "</body></html>"
     )
 
 
-def _render_index(status: dict[str, Any], config: dict[str, Any]) -> str:
+def _render_device_rows(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return "<tr><td colspan='6' class='muted'>" + html.escape(str(data.get("message") or "加载失败")) + "</td></tr>"
+    rows = data.get("rows") or []
+    if not rows:
+        return "<tr><td colspan='6' class='muted'>没有可控制设备。</td></tr>"
+    out: list[str] = []
+    for row in rows:
+        actions = row.get("actions") or []
+        badges = "".join("<span class='badge'>" + html.escape(str(action)) + "</span>" for action in actions)
+        if not badges:
+            badges = "<span class='muted'>—</span>"
+        danger = " <span class='badge danger'>危险</span>" if row.get("dangerous") else ""
+        state = html.escape(str(row.get("state") or "unknown"))
+        unit = str(row.get("unit") or "")
+        if unit:
+            state += " " + html.escape(unit)
+        if str(row.get("state")) == "unavailable":
+            state = "<span class='bad'>" + state + "</span>"
+        elif str(row.get("state")) == "unknown":
+            state = "<span class='muted'>" + state + "</span>"
+        out.append(
+            "<tr>"
+            "<td>" + html.escape(str(row.get("area") or "未分配区域")) + "</td>"
+            "<td>" + html.escape(str(row.get("device") or "未命名设备")) + "</td>"
+            "<td>" + html.escape(str(row.get("type") or "未知")) + danger
+            + "<br><small>" + html.escape(str(row.get("domain") or "")) + "</small></td>"
+            "<td>" + html.escape(str(row.get("name") or ""))
+            + "<br><small><code>" + html.escape(str(row.get("entity_id") or "")) + "</code></small></td>"
+            "<td>" + state + "</td>"
+            "<td>" + badges + "</td>"
+            "</tr>"
+        )
+    return "".join(out)
+
+
+def _render_log_entries(entries: list[dict[str, str]]) -> str:
+    if not entries:
+        return "<div class='muted'>暂无日志。</div>"
+    out: list[str] = []
+    for entry in entries:
+        level = html.escape(str(entry.get("level") or "INFO"))
+        message = html.escape(str(entry.get("message") or "")).replace("\n", "<br>")
+        out.append(
+            "<div class='log-line log-" + level + "'>"
+            "<span class='log-time'>" + html.escape(str(entry.get("time") or "")) + "</span>"
+            "<span class='log-level'>" + level + "</span>"
+            "<span class='log-name'>[" + html.escape(str(entry.get("logger") or "")) + "]</span>"
+            "<span class='log-msg'>" + message + "</span>"
+            "</div>"
+        )
+    return "".join(out)
+
+
+def _render_index(status: dict[str, Any], devices: dict[str, Any],
+                  logs: list[dict[str, str]], config: dict[str, Any]) -> str:
     ha = status["ha"]
-    if ha["reachable"] is True:
-        ha_text = "<span class='ok'>正常</span>"
+    if not ha["configured"]:
+        ha_text = "<span class='bad'>未配置</span>"
+    elif ha["reachable"] is True:
+        ha_text = "<span class='ok'>正常</span> · " + html.escape(str(ha["url"]))
     elif ha["reachable"] is False:
-        ha_text = "<span class='bad'>不可用</span>" + ("（" + html.escape(str(ha["error"])) + "）" if ha["error"] else "")
+        ha_text = "<span class='bad'>不可用</span>"
+        if ha["error"]:
+            ha_text += "（" + html.escape(str(ha["error"])) + "）"
+        ha_text += " · " + html.escape(str(ha["url"]))
     else:
-        ha_text = "<span class='muted'>未配置</span>"
+        ha_text = "<span class='muted'>检测中</span> · " + html.escape(str(ha["url"]))
     endpoint = status["mcp_endpoint"]
     endpoint_text = html.escape(endpoint["display"]) if endpoint["configured"] else "<span class='bad'>未配置</span>"
+
     status_rows = "".join(
-        "<tr><th>" + html.escape(k) + "</th><td>" + v + "</td></tr>"
-        for k, v in [
+        "<tr><th>" + html.escape(key) + "</th><td>" + value + "</td></tr>"
+        for key, value in [
             ("版本", html.escape(status["version"])),
             ("启动时间", html.escape(status["started_at"])),
             ("运行时长", str(status["uptime_seconds"]) + " 秒"),
-            ("HA 配置", "<span class='ok'>已配置</span>" if ha["configured"] else "<span class='bad'>未配置</span>"),
             ("HA 连通性", ha_text),
-            ("HA 地址", html.escape(ha["url"])),
             ("MCP 接入点", endpoint_text),
             ("运行形态", html.escape(status["target"])),
         ]
     )
-    config_rows = "".join(
+    param_items = [
+        item for item in config["items"]
+        if item["key"] not in ("HA_URL", "HA_TOKEN", "MCP_ENDPOINT")
+    ]
+    param_rows = "".join(
         "<tr><th>" + html.escape(item["key"]) + "</th><td>" + html.escape(str(item["value"])) + "</td></tr>"
-        for item in config["items"]
+        for item in param_items
     )
     options = "".join(
-        "<option value='" + html.escape(t["name"]) + "'>" + html.escape(t["name"]) + " — " + html.escape(t["description"]) + "</option>"
-        for t in status["tools"]
+        "<option value='" + html.escape(tool["name"]) + "'>" + html.escape(tool["name"])
+        + " — " + html.escape(tool["description"]) + "</option>"
+        for tool in status["tools"]
     )
     examples = "".join(
-        "<tr><th>" + html.escape(t["name"]) + "</th><td><code>" + html.escape(t["example"]) + "</code></td></tr>"
-        for t in status["tools"]
+        "<tr><th>" + html.escape(tool["name"]) + "</th><td><code>"
+        + html.escape(tool["example"]) + "</code></td></tr>"
+        for tool in status["tools"]
     )
+
+    if devices.get("ok"):
+        device_summary = "共 " + str(devices.get("total", 0)) + " 个可控实体"
+        if devices.get("truncated"):
+            device_summary += "（已截断，可用工具调试台按条件查询）"
+    else:
+        device_summary = str(devices.get("message") or "加载失败")
+
     body = (
-        "<section><h2>运行状态</h2><table>" + status_rows + "</table></section>"
-        "<section><h2>配置（只读，敏感值已掩码）</h2><table>" + config_rows + "</table>"
-        "<p><small>" + html.escape(config["note"]) + "</small></p></section>"
-        "<section><h2>工具调试台</h2>"
+        "<section><h2>运行状态</h2><table class='kv'>" + status_rows + "</table></section>"
+        "<details class='params'><summary>运行参数（只读）</summary>"
+        "<table class='kv'>" + param_rows + "</table>"
+        "<p><small>" + html.escape(config["note"]) + "</small></p></details>"
+        "<section><div class='section-head'><h2>可调用设备</h2>"
+        "<span id='device-summary' class='muted'>" + html.escape(device_summary) + "</span></div>"
+        "<div class='toolbar'>"
+        "<input id='device-filter' type='text' placeholder='按区域、设备、类型、实体过滤…'>"
+        "<button type='button' onclick='loadDevices()'>刷新设备</button>"
+        "</div>"
+        "<table class='device-table'><thead><tr>"
+        "<th>区域</th><th>设备</th><th>类型</th><th>实体</th><th>状态</th><th>可执行动作</th>"
+        "</tr></thead><tbody id='device-body'>" + _render_device_rows(devices) + "</tbody></table>"
+        "<p><small>仅列出可控制实体；危险设备（门锁、安防、车库门等）操作仍需二次确认。</small></p></section>"
+        "<section><div class='section-head'><h2>服务日志</h2>"
+        "<span class='muted'>WebUI 与 bridge 共享日志，最近 200 条</span></div>"
+        "<div class='toolbar'>"
+        "<select id='log-level'><option value='ALL'>全部级别</option><option value='INFO'>INFO</option>"
+        "<option value='WARNING'>WARNING</option><option value='ERROR'>ERROR</option>"
+        "<option value='DEBUG'>DEBUG</option></select>"
+        "<button type='button' onclick='loadLogs()'>刷新日志</button>"
+        "<label class='auto'><input id='log-auto' type='checkbox' checked>自动刷新（5 秒）</label>"
+        "</div>"
+        "<div id='log-box' class='log-box'>" + _render_log_entries(logs) + "</div>"
+        "<p><small>日志文件：" + html.escape(log_file_path()) + "</small></p></section>"
+        "<details class='advanced'><summary>高级：工具调试台</summary>"
+        "<p><small>一般不需要；设备列表与日志已覆盖日常使用。</small></p>"
         "<form method='post' action='/tool'>"
         "<label>选择工具<select name='name'>" + options + "</select></label>"
         "<label>参数（JSON 对象）<textarea name='params' spellcheck='false'>{}</textarea></label>"
         "<button type='submit'>调用</button>"
         "</form>"
-        "<p><small>参数示例：</small></p><table>" + examples + "</table></section>"
+        "<p><small>参数示例：</small></p><table>" + examples + "</table></details>"
     )
-    return _page("homeassistant-xiaozhiserver WebUI", body)
+    return _page("homeassistant-xiaozhiserver WebUI", body, _INDEX_SCRIPT)
 
 
 def _render_tool_result(name: str, params: str, result: Any, status: int) -> str:
@@ -299,9 +592,127 @@ def _render_tool_result(name: str, params: str, result: Any, status: int) -> str
         "<table><tr><th>工具</th><td><code>" + html.escape(name) + "</code></td></tr>"
         "<tr><th>参数</th><td><code>" + html.escape(params) + "</code></td></tr></table></section>"
         "<section><h2>返回</h2><pre>" + html.escape(pretty) + "</pre></section>"
-        "<p><a href='/'>← 返回状态页</a></p>"
+        "<p><a href='/'>← 返回首页</a></p>"
     )
     return _page("调用结果", body)
+
+
+_INDEX_SCRIPT = r"""
+<script>
+function cell(tag, text, cls) {
+  var node = document.createElement(tag);
+  if (cls) node.className = cls;
+  node.textContent = text == null ? '' : String(text);
+  return node;
+}
+function showMessage(tbody, text) {
+  tbody.innerHTML = '';
+  var tr = document.createElement('tr');
+  var td = cell('td', text, 'muted');
+  td.colSpan = 6;
+  tr.appendChild(td);
+  tbody.appendChild(tr);
+}
+async function loadDevices() {
+  var tbody = document.getElementById('device-body');
+  var summary = document.getElementById('device-summary');
+  showMessage(tbody, '加载中…');
+  try {
+    var resp = await fetch('/api/devices', {cache: 'no-store'});
+    var data = await resp.json();
+    tbody.innerHTML = '';
+    if (!data.ok) {
+      showMessage(tbody, data.message || '加载失败');
+      summary.textContent = '';
+      return;
+    }
+    if (!data.rows || !data.rows.length) {
+      showMessage(tbody, '没有可控制设备。');
+      summary.textContent = '共 0 个可控实体';
+      return;
+    }
+    for (var i = 0; i < data.rows.length; i++) {
+      var r = data.rows[i];
+      var tr = document.createElement('tr');
+      tr.appendChild(cell('td', r.area || '未分配区域'));
+      tr.appendChild(cell('td', r.device || '未命名设备'));
+      var typeTd = document.createElement('td');
+      typeTd.appendChild(cell('span', r.type || r.domain || '未知'));
+      if (r.dangerous) typeTd.appendChild(cell('span', '危险', 'badge danger'));
+      typeTd.appendChild(document.createElement('br'));
+      typeTd.appendChild(cell('small', r.domain || ''));
+      tr.appendChild(typeTd);
+      var entTd = document.createElement('td');
+      entTd.appendChild(cell('div', r.name || r.entity_id || ''));
+      entTd.appendChild(cell('small', r.entity_id || '', 'muted'));
+      tr.appendChild(entTd);
+      tr.appendChild(cell('td', (r.state || 'unknown') + (r.unit ? ' ' + r.unit : '')));
+      var actTd = document.createElement('td');
+      if (r.actions && r.actions.length) {
+        for (var j = 0; j < r.actions.length; j++) actTd.appendChild(cell('span', r.actions[j], 'badge'));
+      } else {
+        actTd.appendChild(cell('span', '—', 'muted'));
+      }
+      tr.appendChild(actTd);
+      tbody.appendChild(tr);
+    }
+    summary.textContent = '共 ' + data.total + ' 个可控实体' + (data.truncated ? '（已截断）' : '');
+    applyDeviceFilter();
+  } catch (err) {
+    showMessage(tbody, '加载设备失败：' + err);
+    summary.textContent = '';
+  }
+}
+function applyDeviceFilter() {
+  var input = document.getElementById('device-filter');
+  if (!input) return;
+  var q = (input.value || '').trim().toLowerCase();
+  var rows = document.querySelectorAll('#device-body tr');
+  for (var i = 0; i < rows.length; i++) {
+    rows[i].style.display = (!q || rows[i].textContent.toLowerCase().indexOf(q) >= 0) ? '' : 'none';
+  }
+}
+async function loadLogs() {
+  var box = document.getElementById('log-box');
+  var level = document.getElementById('log-level').value;
+  try {
+    var resp = await fetch('/api/logs?limit=200&level=' + encodeURIComponent(level), {cache: 'no-store'});
+    var data = await resp.json();
+    box.innerHTML = '';
+    if (!data.ok) {
+      box.appendChild(cell('div', data.message || '加载日志失败', 'muted'));
+      return;
+    }
+    if (!data.entries || !data.entries.length) {
+      box.appendChild(cell('div', '暂无日志。', 'muted'));
+      return;
+    }
+    for (var i = 0; i < data.entries.length; i++) {
+      var e = data.entries[i];
+      var line = document.createElement('div');
+      line.className = 'log-line log-' + (e.level || 'INFO');
+      line.appendChild(cell('span', e.time || '', 'log-time'));
+      line.appendChild(cell('span', e.level || '', 'log-level'));
+      line.appendChild(cell('span', '[' + (e.logger || '') + ']', 'log-name'));
+      line.appendChild(cell('span', e.message || '', 'log-msg'));
+      box.appendChild(line);
+    }
+    box.scrollTop = box.scrollHeight;
+  } catch (err) {
+    box.innerHTML = '';
+    box.appendChild(cell('div', '加载日志失败：' + err, 'muted'));
+  }
+}
+var filterInput = document.getElementById('device-filter');
+if (filterInput) filterInput.addEventListener('input', applyDeviceFilter);
+var levelSelect = document.getElementById('log-level');
+if (levelSelect) levelSelect.addEventListener('change', loadLogs);
+setInterval(function () {
+  var auto = document.getElementById('log-auto');
+  if (auto && auto.checked) loadLogs();
+}, 5000);
+</script>
+"""
 
 
 def main() -> None:

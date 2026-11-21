@@ -31,8 +31,29 @@ def check(name: str, cond: bool, extra: str = "") -> None:
 r = client.get("/")
 check("无需登录访问首页 200", r.status_code == 200, str(r.status_code))
 check("首页包含运行状态", "运行状态" in r.text)
-check("首页包含工具调试台", "工具调试台" in r.text)
-check("首页包含只读配置", "配置（只读" in r.text)
+check("首页包含可调用设备", "可调用设备" in r.text)
+check("首页包含服务日志", "服务日志" in r.text)
+check("首页包含折叠的工具调试台", "高级：工具调试台" in r.text)
+check("首页不再重复展示只读配置表", "配置（只读" not in r.text)
+
+r = client.get("/api/devices")
+check("无需登录访问 /api/devices 200", r.status_code == 200, str(r.status_code))
+devices = r.json()
+check("devices 返回 rows 列表", isinstance(devices.get("rows"), list), str(type(devices.get("rows"))))
+if os.environ.get("HA_URL") and os.environ.get("HA_TOKEN"):
+    check("已配置 HA 时设备加载成功", devices.get("ok") is True, json.dumps(devices, ensure_ascii=False)[:300])
+else:
+    check("未配置 HA 时设备返回 config_missing", devices.get("code") == "config_missing", json.dumps(devices, ensure_ascii=False)[:300])
+
+r = client.get("/api/logs")
+check("无需登录访问 /api/logs 200", r.status_code == 200, str(r.status_code))
+logs = r.json()
+check("logs 返回 entries 列表", isinstance(logs.get("entries"), list), str(type(logs.get("entries"))))
+check("logs 返回日志文件路径", isinstance(logs.get("file"), str) and bool(logs.get("file")))
+r = client.get("/api/logs?limit=abc")
+check("logs 非法 limit 返回 400", r.status_code == 400, str(r.status_code))
+r = client.get("/api/logs?level=NOT_A_LEVEL")
+check("logs 非法 level 返回 400", r.status_code == 400, str(r.status_code))
 
 r = client.get("/api/status")
 check("无需登录访问 /api/status 200", r.status_code == 200, str(r.status_code))

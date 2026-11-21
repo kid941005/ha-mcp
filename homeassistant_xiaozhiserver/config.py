@@ -92,6 +92,10 @@ if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
     log.warning("环境变量 LOG_LEVEL=%r 非法，使用 INFO", LOG_LEVEL)
     LOG_LEVEL = "INFO"
 
+# 共享日志文件（WebUI 与 bridge 两个进程都写入，WebUI 读取尾部展示）
+# 留空时使用系统临时目录，通常不需要设置。
+LOG_FILE = env_str("LOG_FILE", "")
+
 # 设备列表
 DEFAULT_LIST_LIMIT = env_int("DEFAULT_LIST_LIMIT", 50, 1, 10000)
 MAX_LIST_LIMIT = env_int("MAX_LIST_LIMIT", 500, 1, 10000)

@@ -22,10 +22,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+try:
+    from homeassistant_xiaozhiserver.logging_setup import setup_logging
+    setup_logging()
+except Exception:  # pragma: no cover - 独立运行时退回基础配置
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
 logger = logging.getLogger("MCP_PIPE")
 
 INITIAL_BACKOFF = 1
