@@ -1,4 +1,4 @@
-name: Build and publish GHCR image
+name: Build and publish GHCR + Docker Hub image
 
 on:
   workflow_dispatch:
@@ -32,9 +32,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Resolve image metadata
         id: meta
         shell: bash
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
           VERSION="${{ github.event.inputs.version }}"
@@ -43,6 +51,7 @@ jobs:
           fi
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dockerhub=$DOCKERHUB_USER" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -54,6 +63,8 @@ jobs:
           tags: |
             ghcr.io/${{ steps.meta.outputs.owner }}/homeassistant-xiaozhiserver:${{ steps.meta.outputs.version }}
             ghcr.io/${{ steps.meta.outputs.owner }}/homeassistant-xiaozhiserver:latest
+            ${{ steps.meta.outputs.dockerhub }}/homeassistant-xiaozhiserver:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.dockerhub }}/homeassistant-xiaozhiserver:latest
           labels: |
             org.opencontainers.image.title=homeassistant-xiaozhiserver
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
