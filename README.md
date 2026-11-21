@@ -164,6 +164,8 @@ cp .env.example .env
 
 `docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.0`，无需本地构建：
 
+> 同一版本也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:1.11.0`（及 `:latest`），网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
+
 ```bash
 docker compose pull
 docker compose up -d
