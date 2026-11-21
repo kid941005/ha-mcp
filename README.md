@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.11.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.11.1** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -162,9 +162,9 @@ cp .env.example .env
 
 ### 5.2 Docker Compose（推荐）
 
-`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.0`，无需本地构建：
+`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.1`，无需本地构建：
 
-> 同一版本也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:1.11.0`（及 `:latest`），网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
+> 同一版本也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:1.11.1`（及 `:latest`），网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
 
 ```bash
 docker compose pull
@@ -212,7 +212,7 @@ python -m homeassistant_xiaozhiserver
     build:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.1
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:
@@ -248,12 +248,12 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 | `area` | string | 否 | 区域过滤：区域名称或 `area_id`，模糊匹配（如「客厅」「living_room」）；依赖 HA 区域注册表返回 `area_name`，按 `area_id` 过滤始终可用 |
 | `controllable_only` | bool | 否 | 只返回可控制设备（自动排除 sensor 等只读实体）；**不传且无其他过滤条件时默认 true** |
 | `group_by` | string | 否 | `entity`（默认，逐实体）或 `device`（按物理设备聚合） |
-| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`、上限 `MAX_LIST_LIMIT`；**无过滤条件时默认 20** |
+| `limit` | int | 否 | 每页条数，默认 `DEFAULT_LIST_LIMIT`（通常 50）、上限 `MAX_LIST_LIMIT`；**无过滤条件时同样使用 `DEFAULT_LIST_LIMIT`** |
 | `offset` | int | 否 | 起始偏移，默认 0 |
 
 > `keyword`、`domain`、`area` 可任意组合，例如 `{"area":"客厅","domain":"light"}` 只返回客厅的灯。
 >
-> **默认收敛**：不传任何过滤条件时，默认只返回可控制设备且每页 20 条（响应里 `applied_defaults` 标示），避免一次把上百个实体塞给模型；需要全量时显式传 `controllable_only=false` 并配合 `limit`/`offset`。
+> **默认收敛**：不传任何过滤条件时，默认只返回可控制设备且每页 `DEFAULT_LIST_LIMIT` 条（通常 50，响应里 `applied_defaults` 标示），避免一次把上百个实体塞给模型；需要全量时显式传 `controllable_only=false` 并配合 `limit`/`offset`。若 `has_more=true`，目标设备可能不在当前页，应先按 `keyword`/`area` 精确过滤。
 >
 > **未知参数不再静默忽略**：传入本工具不支持的参数会返回 `{"ok":false,"code":"invalid_argument","message":"不支持的参数：...；可用参数：..."}`，避免参数名写错却拿到全量数据。
 
@@ -618,7 +618,7 @@ python tests/e2e_mcp_client.py
 ## 11. 设备规模与性能
 
 - `list_devices` 支持 `keyword`（别名 `query`/`q`/`search`/`name`）/ `domain` / `area` 过滤 + `limit` / `offset` 分页（默认 50、上限 500），返回 `has_more` / `next_offset` 便于续拉，避免实体过多撑爆上下文；
-- 无过滤条件时 `list_devices` 默认 `controllable_only=true` 且每页 20 条（`applied_defaults` 标示），避免把上百个实体一次性塞给模型；未知参数返回 `invalid_argument` 而非静默忽略；
+- 无过滤条件时 `list_devices` 默认 `controllable_only=true` 且每页 `DEFAULT_LIST_LIMIT` 条（通常 50，`applied_defaults` 标示）；`has_more=true` 时必须继续按 `keyword`/`area` 过滤而不是用当前页推断全量；未知参数返回 `invalid_argument` 而非静默忽略；
 - `group_by="device"` 按物理设备聚合，`controllable_only=true` 只看可控设备，进一步压缩结果；
 - `get_device_state` 默认只返回关键属性（亮度、色温、音量、温度、位置、电池等），完整属性需显式传 `include_all_attributes=true`；
 - `list_services` 指定 entity/domain 时返回字段明细，未指定时默认只返回服务名，便于按需展开。
@@ -640,6 +640,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.11.1 | 修复 `list_devices` 无过滤时忽略 `DEFAULT_LIST_LIMIT`、固定按 20 条分页的问题（现按配置通常 50 条）；默认提示动态显示条数，`has_more=true` 时提示用 `keyword`/`area` 精确过滤；回归测试增加 `applied_limit_gt: 20` 断言，防止再次退化 |
 | v1.11.0 | `list_devices` 易用性与防误用：支持 `query`/`q`/`search`/`name` 关键字别名；未知参数返回 `invalid_argument` 并列出可用参数（不再静默忽略）；无过滤条件时默认 `controllable_only=true` 且每页 20 条；工具描述内置「点名设备直接 control_device」硬约束 |
 | v1.10.1 | 全项目冗余审计与清理：补齐 README 第 9 章标题、清理 xiaozhi-server 旧「方式 B」MCP 配置（`deploy/data/.mcp_server_settings.json` 置空）、更新 `deploy/.env` 服务名并补充 `MCP_ENDPOINT` 说明；代码层确认已无 HTTP/SSE/uvicorn/端口残留 |
 | v1.10.0 | 仅保留方式 A：移除 HTTP / SSE / streamable-http、8090 端口、`/health` / `/ready`、uvicorn 与方式 B 配置；`Dockerfile` 统一为 stdio bridge 镜像；`mcp_pipe.py` 只支持 stdio 子进程；测试改为 stdio 客户端；compose 不再暴露端口 |

@@ -56,6 +56,11 @@ def verify_case(index, name, args, r, expected):
     check(not r["isError"], label + " 不是 MCP isError", r["isError"])
     if "ok" in expected:
         check(d.get("ok") is expected["ok"], label + " ok", d.get("ok"))
+    if "applied_limit_gt" in expected:
+        applied_limit = (d.get("applied_defaults") or {}).get("limit")
+        check(isinstance(applied_limit, int) and applied_limit > expected["applied_limit_gt"],
+              label + " applied_defaults.limit > " + str(expected["applied_limit_gt"]),
+              applied_limit)
     for key in ("status", "code", "total", "count", "grouped_by", "domain",
                 "domain_count", "service_count"):
         if key in expected:
@@ -128,9 +133,10 @@ async def main():
 
         cases = [
             # 列表 / 过滤 / 分页 / 聚合
-            # 无过滤条件：默认只返回可控制设备且每页 20 条（7 个实体中 6 个可控）
+            # 无过滤条件：默认只返回可控制设备且每页 DEFAULT_LIST_LIMIT 条（7 个实体中 6 个可控）
             ("list_devices", {}, {"ok": True, "total": 6, "count": 6,
-                                   "grouped_by": "entity"}),
+                                   "grouped_by": "entity",
+                                   "applied_limit_gt": 20}),
             ("list_devices", {"domain": "light"}, {"ok": True, "total": 1}),
             ("list_devices", {"keyword": "客厅"}, {"ok": True, "total": 3}),
             ("list_devices", {"area": "客厅"}, {"ok": True, "total": 6,

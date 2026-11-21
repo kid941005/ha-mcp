@@ -5,7 +5,7 @@
 services:
   homeassistant-xiaozhiserver-bridge:
     # 使用 GHCR 已发布镜像；如需本地构建，注释掉 image 并启用下面两行 build。
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.1
     # build:
     #   context: .
     #   dockerfile: Dockerfile

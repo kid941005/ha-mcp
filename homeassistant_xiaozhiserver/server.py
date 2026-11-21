@@ -256,15 +256,17 @@ async def list_devices(
     manufacturer/model/area 与 entities 列表）。
     结果支持分页：limit 每页条数，offset 起始偏移（默认 0）。
     未传任何过滤条件（keyword/domain/area）时，为控制返回体积默认只返回可控制
-    设备且每页 20 条；可用 controllable_only=false、limit 显式覆盖。
+    设备且每页 DEFAULT_LIST_LIMIT（通常 50）条；可用 controllable_only=false、
+    limit 显式覆盖。
     传入本工具不支持的参数会返回 invalid_argument 并列出可用参数。
 
     每个实体带 controllable（是否可控制）、actions（内置动作）、
     device_id/device_name/area_id/area_name。
 
-    重要：当用户明确点名某个设备要开/关时（如「打开客厅灯」「关一下风扇」），
-    直接调用 control_device(entity="客厅灯", action="turn_on")，不要先调用
-    list_devices 再控制。
+    重要：当用户明确点名某个设备要开/关时（如「打开客厅灯」「关一下风扇」
+    「关掉餐厅氛围灯」），直接调用 control_device(entity="客厅灯",
+    action="turn_on")；带房间名和类型时也直接传完整名称，不要先调用
+    list_devices 再控制，更不要根据未过滤列表的前几页推断设备不存在或状态。
 
     适用场景：用户问「有哪些设备」「列出所有的灯」「客厅有什么设备」「哪些设备能控制」。
     """
@@ -295,8 +297,8 @@ async def list_devices(
     else:
         controllable_only = _as_bool(controllable_only)
     if limit is None and not has_filter:
-        limit = 20
-        applied_defaults["limit"] = 20
+        limit = DEFAULT_LIST_LIMIT
+        applied_defaults["limit"] = limit
 
     try:
         page_args = _parse_pagination(limit, offset)
@@ -357,8 +359,10 @@ async def list_devices(
         if applied_defaults:
             note = "未指定过滤条件，默认仅返回可控制设备"
             if "limit" in applied_defaults:
-                note += "、每页 20 条"
+                note += "、每页 " + str(applied_defaults["limit"]) + " 条"
             msg = note + "（可用 controllable_only=false 或 limit 覆盖）。" + msg
+        if has_more and not has_filter:
+            msg += " 目标设备可能不在当前页，请用 keyword/area 精确过滤后再控制。"
         return {
             "ok": True, "grouped_by": grouped_by, "registry_available": reg is not None,
             "area": (area.strip() if area else None),
