@@ -1,35 +1,17 @@
-# homeassistant-xiaozhiserver — 小智 MCP 接入点 bridge（stdio <-> WebSocket）
+# homeassistant-xiaozhiserver — 小智 MCP 接入点 bridge + WebUI
 # 用法：cp .env.example .env，填写 MCP_ENDPOINT / HA_URL / HA_TOKEN，然后：
 #   docker compose pull && docker compose up -d
-# 本服务主动连出到 MCP_ENDPOINT，不监听、也不需要映射任何端口。
+# 一个容器同时运行 MCP 桥接和 WebUI；WebUI 固定 8099，无独立密码。
 services:
-  homeassistant-xiaozhiserver-bridge:
-    # 使用 GHCR 已发布镜像；如需本地构建，注释掉 image 并启用下面两行 build。
+  homeassistant-xiaozhiserver:
     image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
+    # 如需本地构建，注释掉 image 并启用下面两行 build。
     # build:
     #   context: .
     #   dockerfile: Dockerfile
-    container_name: homeassistant-xiaozhiserver-bridge
+    container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     env_file:
       - .env
-    environment:
-      TZ: Asia/Shanghai
-
-  # 可选 WebUI：默认不启动。需要时：
-  #   docker compose --profile webui up -d homeassistant-xiaozhiserver-webui
-  homeassistant-xiaozhiserver-webui:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
-    container_name: homeassistant-xiaozhiserver-webui
-    restart: unless-stopped
-    profiles: ["webui"]
-    command: ["python", "-m", "homeassistant_xiaozhiserver.webui"]
-    env_file:
-      - .env
-    environment:
-      TZ: Asia/Shanghai
-      WEBUI_ENABLED: "true"
-      WEBUI_PORT: "8099"
     ports:
-      # WEBUI_BIND 默认为 127.0.0.1（仅本机）；局域网访问时在 .env 中设为宿主机局域网 IP
-      - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-8099}:8099"
+      - "8099:8099"

@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.12.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.13.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -42,7 +42,7 @@
 | 健壮错误处理 | 所有工具返回结构化 JSON；失败给 `code` / `message` / `hint`，不抛异常堆栈、不使服务崩溃 |
 | 配置安全 | `HA_URL` / `HA_TOKEN` / `MCP_ENDPOINT` 只从环境变量读取，不写入镜像或代码 |
 | 离线可测 | 自带 fake HA 模拟器与 stdio 端到端测试，无需真实 Home Assistant 即可验证全部工具 |
-| 可选 WebUI | 状态页 + 工具调试台 + 配置只读，独立进程/容器，默认关闭；`WEBUI_TOKEN` 鉴权，敏感值仅掩码展示 |
+| WebUI | 随服务启动的状态页 + 工具调试台 + 配置只读，固定 `8099`；无独立密码，直接使用 `HA_URL` / `HA_TOKEN`，敏感值仅掩码展示 |
 
 ---
 
@@ -89,18 +89,19 @@ homeassistant-xiaozhiserver/
 │   ├── danger.py                    # 危险设备判定、一次性确认令牌
 │   ├── views.py                     # 实体摘要、可控标记、按设备聚合
 │   ├── server.py                    # 六个 MCP 工具、stdio 进程入口
-│   └── webui.py                     # 可选 WebUI：状态页/工具调试台/配置只读
+│   └── webui.py                     # WebUI：状态页/工具调试台/配置只读（随服务启动）
 ├── server.py                        # 兼容入口（等价于 python -m homeassistant_xiaozhiserver）
 ├── mcp_pipe.py                      # 小智 MCP 接入点桥接（WebSocket ↔ stdio）
 ├── requirements.txt
-├── Dockerfile                       # bridge/WebUI 共用镜像（stdio MCP server + mcp_pipe）
-├── docker-compose.yml               # 独立运行（默认 GHCR 镜像，无端口）
+├── Dockerfile                       # 单容器镜像（stdio MCP server + mcp_pipe + WebUI）
+├── docker-entrypoint.sh             # 容器入口：WebUI 后台 + MCP bridge 前台
+├── docker-compose.yml               # 单容器运行（GHCR 镜像，暴露 8099 WebUI）
 ├── .env.example
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器
 │   ├── e2e_mcp_client.py            # stdio 端到端 MCP 客户端断言测试
 │   ├── run_local_test.sh
-│   └── webui_smoke.py               # WebUI 鉴权与接口冒烟测试
+│   └── webui_smoke.py               # WebUI 接口冒烟测试（无需密码）
 └── README.md
 ```
 
@@ -116,7 +117,7 @@ homeassistant-xiaozhiserver/
 | `views.py` | 实体视图、关键属性裁剪、可控性/危险标记、按物理设备聚合 |
 | `server.py` | 六个 MCP 工具；固定 `stdio` 传输；进程入口 |
 | `mcp_pipe.py` | 连接小智 MCP 接入点，启动 stdio MCP server，双向搬运 JSON-RPC，断线自动重连 |
-| `webui.py` | 可选 WebUI（FastAPI）：状态查看、工具调试、配置只读；默认关闭，独立进程运行 |
+| `webui.py` | WebUI（FastAPI）：状态查看、工具调试、配置只读；随服务启动，固定 `0.0.0.0:8099`，无独立密码 |
 
 ---
 
@@ -145,11 +146,7 @@ homeassistant-xiaozhiserver/
 | `DANGER_CONFIRM_TTL` | | `120` | 危险操作确认令牌有效期（秒），一次性使用 |
 | `DANGEROUS_DOMAINS` | | `lock,alarm_control_panel` | 视为危险设备的 domain（逗号分隔） |
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
-| `WEBUI_ENABLED` | | `false` | 是否启动可选 WebUI；默认关闭，不影响 MCP 桥接 |
-| `WEBUI_TOKEN` | WebUI 启用时必填 | — | WebUI 鉴权口令（HTTP Basic 密码或 Bearer Token）；未设置则 WebUI 拒绝启动 |
-| `WEBUI_HOST` | | `0.0.0.0` | WebUI 容器内监听地址 |
-| `WEBUI_BIND` | | `127.0.0.1` | 宿主机端口绑定地址；局域网访问填宿主机局域网 IP |
-| `WEBUI_PORT` | | `8099` | WebUI 监听端口 |
+> WebUI 随服务启动，固定监听 `0.0.0.0:8099`，无独立密码，直接复用 `HA_URL` / `HA_TOKEN`；不需要任何 `WEBUI_*` 环境变量。
 
 > 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
 > 安全：`HA_TOKEN` / `MCP_ENDPOINT` 只通过环境变量注入，不写入镜像、代码或 Git。
@@ -178,19 +175,19 @@ cp .env.example .env
 ```bash
 docker compose pull
 docker compose up -d
-docker compose logs -f homeassistant-xiaozhiserver-bridge
+docker compose logs -f homeassistant-xiaozhiserver
 ```
 
 需要自己改代码构建时，把 `docker-compose.yml` 里的 `image:` 注释掉、启用其下的 `build:` 两行，再执行 `docker compose up -d --build`。
 
-看到以下日志即表示桥接成功：
+容器内会同时启动两个进程：WebUI（后台）和 MCP bridge（前台）。看到以下日志即表示桥接成功：
 
 ```text
 MCP_PIPE - MCP接入点连接成功
 MCP_PIPE - 已启动 MCP server：...
 ```
 
-> **bridge 服务不监听任何端口**，其 compose 定义中没有 `ports` / `expose` / `healthcheck`；判断存活看容器状态与日志，不要访问 8090。可选的 WebUI 服务另有一条端口映射，宿主机绑定地址由 `WEBUI_BIND` 控制（默认 `127.0.0.1`，见 5.5），与 bridge 无关。
+> **MCP bridge 本身不监听端口**，它主动连出到 `MCP_ENDPOINT`，不需要做入站映射。容器暴露的 `8099` 只给 WebUI 用：浏览器打开 `http://<宿主机IP>:8099/` 即可，无需登录。
 
 ### 5.3 本地开发（无 Docker）
 
@@ -214,70 +211,54 @@ python -m homeassistant_xiaozhiserver
 
 ### 5.4 并入现有 deploy compose
 
-`deploy/docker-compose.yml` 已包含 bridge 服务，关键配置如下：
+`deploy/docker-compose.yml` 已包含单服务，关键配置如下：
 
 ```yaml
-  homeassistant-xiaozhiserver-bridge:
-    build:
-      context: ../homeassistant-xiaozhiserver
-      dockerfile: Dockerfile
+  homeassistant-xiaozhiserver:
     image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
-    container_name: homeassistant-xiaozhiserver-bridge
+    container_name: homeassistant-xiaozhiserver
     restart: unless-stopped
     env_file:
       - .env
-    environment:
-      - TZ=Asia/Shanghai
+    ports:
+      - "8099:8099"
 ```
 
 在 `deploy/.env` 中补充 `MCP_ENDPOINT` / `HA_URL` / `HA_TOKEN` 后执行：
 
 ```bash
 cd deploy
-docker compose up -d --build homeassistant-xiaozhiserver-bridge
-docker compose ps homeassistant-xiaozhiserver-bridge
-docker compose logs -f homeassistant-xiaozhiserver-bridge
+docker compose pull homeassistant-xiaozhiserver
+docker compose up -d homeassistant-xiaozhiserver
+docker compose ps homeassistant-xiaozhiserver
+docker compose logs -f homeassistant-xiaozhiserver
 ```
 
-> bridge 主动连出到 `MCP_ENDPOINT`，与 `xiaozhi-server` 不需要同网络，也不需要为它做端口映射。
+> bridge 主动连出到 `MCP_ENDPOINT`，与 `xiaozhi-server` 不需要同网络，也不需要为它做端口映射；`8099` 仅供 WebUI 访问。
 
-### 5.5 可选 WebUI（默认关闭）
+### 5.5 WebUI
 
-WebUI 是**独立进程/独立容器**，用于查看运行状态、调试六个工具、只读查看配置；它不在 MCP 桥接链路里，关闭时对桥接零影响。
+WebUI 与 MCP bridge 在**同一个容器**内启动：WebUI 后台运行，bridge 前台运行。它用于查看运行状态、调试六个工具、只读查看配置。
 
-1. 在 `.env` 中启用并设置强口令（务必使用足够长的随机串）：
+- 固定监听 `0.0.0.0:8099`，无独立密码；
+- 直接使用 `.env` 里的 `HA_URL` / `HA_TOKEN` 连接 Home Assistant，不需要额外环境变量。
 
-   ```bash
-   WEBUI_ENABLED=true
-   WEBUI_TOKEN=请替换为足够长的随机字符串
-   WEBUI_PORT=8099
-   # 局域网访问时设为宿主机局域网 IP；仅本机访问保持 127.0.0.1
-   WEBUI_BIND=192.168.50.100
-   ```
-
-2. 用 compose profile 启动（默认 `docker compose up -d` 不会启动它）：
-
-   ```bash
-   docker compose --profile webui up -d homeassistant-xiaozhiserver-webui
-   docker compose logs -f homeassistant-xiaozhiserver-webui
-   ```
-
-3. 浏览器访问 `http://<宿主机IP>:8099/`（例如 `http://192.168.50.100:8099/`），用户名任意、密码填 `WEBUI_TOKEN`（也支持 `Authorization: Bearer <WEBUI_TOKEN>`）。
+容器启动后浏览器访问 `http://<宿主机IP>:8099/`（例如 `http://192.168.50.100:8099/`）即可。
 
 本机直接运行（不使用 Docker）：
 
 ```bash
-export WEBUI_ENABLED=true
-export WEBUI_TOKEN="你的强随机口令"
+export HA_URL="https://your-ha.example:8123"
+export HA_TOKEN="你的HA长期访问令牌"
 python -m homeassistant_xiaozhiserver.webui
 ```
 
 安全说明：
 
-- compose 的宿主机绑定地址由 `WEBUI_BIND` 控制：默认 `127.0.0.1` 仅本机；局域网访问时设为本机局域网 IP（如 `192.168.50.100`）。不要直接映射到公网，远程访问优先走 SSH 隧道或带鉴权的反向代理。
+- WebUI **没有登录口令**，请只绑定可信内网，不要直接暴露公网；远程访问优先走 SSH 隧道或带鉴权的反向代理。
 - 页面与 `/api/status`、`/api/config` 只展示掩码后的 `HA_TOKEN` / `MCP_ENDPOINT` 令牌，不会回传明文。
 - 工具调试台只允许调用六个白名单工具，参数必须是 JSON 对象。
-- 未设置 `WEBUI_TOKEN` 时 WebUI 拒绝启动（退出码 2），避免无鉴权暴露。
+- 容器以非 root 用户（uid 10001）运行。
 
 ---
 
@@ -469,7 +450,7 @@ cp .env.example .env
 # 填写 MCP_ENDPOINT / HA_URL / HA_TOKEN
 docker compose pull
 docker compose up -d
-docker compose logs -f homeassistant-xiaozhiserver-bridge
+docker compose logs -f homeassistant-xiaozhiserver
 ```
 
 容器配置了 `restart: unless-stopped`；进程内部还有指数退避重连（1s 起，最大 600s），`mcp-endpoint-server` 重启或网络抖动后会自动恢复。
@@ -596,14 +577,14 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 
 ### 9.2 排查步骤
 
-1. **看 bridge 日志**：`docker logs -f homeassistant-xiaozhiserver-bridge`。
+1. **看 bridge 日志**：`docker logs -f homeassistant-xiaozhiserver`。
    - 先确认出现 `MCP接入点连接成功` 与 `已启动 MCP server`；
    - 若一直重连，检查 `MCP_ENDPOINT` 是否为工具端 `ws://` 地址、token 是否有效、bridge 能否访问该主机/端口。
 2. **看容器状态**：`docker compose ps`。容器应保持 `Up`；反复重启通常是 `MCP_ENDPOINT` 未设置或格式错误（进程会直接退出）。
 3. **看日志（带 call_id 追踪）**：每条日志格式为 `时间 级别 logger [call_id] 消息`，`call_id` 可把一次工具调用的入口、HA 请求与回读串起来。
    ```bash
-   docker logs -f homeassistant-xiaozhiserver-bridge 2>&1 | grep -E 'tool=|action |HA registry|MCP接入点'
-   docker logs homeassistant-xiaozhiserver-bridge 2>&1 | grep '<call_id>'
+   docker logs -f homeassistant-xiaozhiserver 2>&1 | grep -E 'tool=|action |HA registry|MCP接入点'
+   docker logs homeassistant-xiaozhiserver 2>&1 | grep '<call_id>'
    ```
    关键日志示例：
    - `tool=list_devices start args=...` / `tool=list_devices done ok=true elapsed_ms=...`
@@ -641,7 +622,7 @@ export TEST_TOKEN=任意本地测试口令
 bash tests/run_local_test.sh
 ```
 
-脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 的鉴权、状态、配置掩码与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
+脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 无需登录即可访问、状态、配置掩码与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
 
 也可分两个终端手动运行：
 
@@ -679,7 +660,7 @@ python tests/e2e_mcp_client.py
 - 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，并仅授予必要的设备控制权限。
 - 若 `mcp-endpoint-server` 在公网，使用 `wss://` 并确保 token 不泄露；`mcp_pipe.py` 日志已对 query 脱敏。
-- 可选 WebUI 默认关闭；启用时必须设置强随机 `WEBUI_TOKEN`，并通过 `WEBUI_BIND` 限制为可信内网地址，不要直接暴露公网；页面和 API 只展示掩码后的敏感值。
+- WebUI 无独立密码、固定 `8099`；请只绑定可信内网，不要直接暴露公网，远程访问优先走 SSH 隧道或带鉴权的反向代理；页面和 API 只展示掩码后的敏感值。
 
 ---
 
@@ -688,7 +669,8 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
-| v1.12.0 | 新增可选 WebUI（默认关闭）：状态页、六工具调试台、配置只读；FastAPI + 服务端渲染，无前端构建；`WEBUI_TOKEN` 必填、Basic/Bearer 鉴权，敏感值掩码；独立 compose profile，不改变 bridge 出站拓扑；新增 `tests/webui_smoke.py` |
+| v1.13.0 | 简化部署：WebUI 与 MCP bridge 合并为单容器（`docker-entrypoint.sh` 同时启动两进程）；WebUI 去掉独立密码与全部 `WEBUI_*` 环境变量，固定监听 `0.0.0.0:8099`，直接复用 `HA_URL` / `HA_TOKEN`；compose 收敛为单服务；冒烟测试改为无需登录 |
+| v1.12.0 | 新增可选 WebUI（默认关闭）：状态页、六工具调试台、配置只读；FastAPI + 服务端渲染，无前端构建；独立 compose profile，不改变 bridge 出站拓扑；新增 `tests/webui_smoke.py` |
 | v1.11.1 | 修复 `list_devices` 无过滤时忽略 `DEFAULT_LIST_LIMIT`、固定按 20 条分页的问题（现按配置通常 50 条）；默认提示动态显示条数，`has_more=true` 时提示用 `keyword`/`area` 精确过滤；回归测试增加 `applied_limit_gt: 20` 断言，防止再次退化 |
 | v1.11.0 | `list_devices` 易用性与防误用：支持 `query`/`q`/`search`/`name` 关键字别名；未知参数返回 `invalid_argument` 并列出可用参数（不再静默忽略）；无过滤条件时默认 `controllable_only=true` 且每页 20 条；工具描述内置「点名设备直接 control_device」硬约束 |
 | v1.10.1 | 全项目冗余审计与清理：补齐 README 第 9 章标题、清理 xiaozhi-server 旧「方式 B」MCP 配置（`deploy/data/.mcp_server_settings.json` 置空）、更新 `deploy/.env` 服务名并补充 `MCP_ENDPOINT` 说明；代码层确认已无 HTTP/SSE/uvicorn/端口残留 |

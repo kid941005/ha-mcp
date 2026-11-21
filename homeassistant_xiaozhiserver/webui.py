@@ -1,47 +1,39 @@
 # -*- coding: utf-8 -*-
-"""可选 WebUI：状态查看、工具调试台、配置只读。
+"""WebUI：状态查看、工具调试台、配置只读。
 
-默认关闭。仅在 WEBUI_ENABLED=true 且设置了 WEBUI_TOKEN 时启动：
+直接使用 .env 中的 HA_URL / HA_TOKEN 连接 Home Assistant，不再设置独立 WebUI 密码：
     python -m homeassistant_xiaozhiserver.webui
 
 安全约定：
-- 所有请求必须携带 WEBUI_TOKEN（HTTP Basic 密码或 Bearer Token）；
+- WebUI 无独立登录口令，请只绑定可信内网，不要直接暴露公网；
 - HA_TOKEN、MCP_ENDPOINT 的令牌只做掩码展示，绝不回传明文；
 - 工具名白名单，只允许调用 server.py 暴露的六个工具。
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import html
 import json
 import logging
 import os
-import secrets
 import time
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import __version__
 from . import server as mcp_server
 from .client import HAError
-from .config import (
-    DEFAULT_LIST_LIMIT,
-    LOG_LEVEL,
-    MAX_LIST_LIMIT,
-    WEBUI_ENABLED,
-    WEBUI_HOST,
-    WEBUI_PORT,
-    WEBUI_TOKEN,
-)
+from .config import DEFAULT_LIST_LIMIT, LOG_LEVEL, MAX_LIST_LIMIT
 from .logging_setup import setup_logging
 
 log = logging.getLogger("homeassistant-xiaozhiserver.webui")
 
 _STARTED_AT = time.time()
+WEBUI_HOST = "0.0.0.0"
+WEBUI_PORT = 8099
 
 # 工具白名单：名称 -> (说明, 参数示例)
 _TOOLS: list[tuple[str, str, str]] = [
@@ -93,36 +85,7 @@ def _mask_endpoint(raw: str) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
 
 
-def _provided_token(request: Request) -> str | None:
-    header = request.headers.get("authorization", "")
-    lowered = header.lower()
-    if lowered.startswith("basic "):
-        try:
-            decoded = base64.b64decode(header[6:]).decode("utf-8")
-        except (ValueError, UnicodeDecodeError):
-            return None
-        _user, sep, password = decoded.partition(":")
-        return password if sep else None
-    if lowered.startswith("bearer "):
-        return header[7:].strip()
-    return None
-
-
-def create_app(token: str | None = None) -> FastAPI:
-    """构建 WebUI 应用；token 为空时使用环境中的 WEBUI_TOKEN。"""
-    expected = (token if token is not None else WEBUI_TOKEN) or ""
-
-    async def require_auth(request: Request) -> None:
-        if not expected:
-            raise HTTPException(status_code=500, detail="WEBUI_TOKEN 未配置，WebUI 拒绝服务")
-        provided = _provided_token(request)
-        if not provided or not secrets.compare_digest(provided, expected):
-            raise HTTPException(
-                status_code=401,
-                detail="需要 WEBUI_TOKEN 鉴权",
-                headers={"WWW-Authenticate": 'Basic realm="homeassistant-xiaozhiserver"'},
-            )
-
+def create_app() -> FastAPI:
     app = FastAPI(title="homeassistant-xiaozhiserver WebUI", docs_url=None, redoc_url=None, openapi_url=None)
 
     async def _status_data() -> dict[str, Any]:
@@ -183,26 +146,24 @@ def create_app(token: str | None = None) -> FastAPI:
                 {"key": "LOG_LEVEL", "value": LOG_LEVEL, "secret": False},
                 {"key": "DEFAULT_LIST_LIMIT", "value": str(DEFAULT_LIST_LIMIT), "secret": False},
                 {"key": "MAX_LIST_LIMIT", "value": str(MAX_LIST_LIMIT), "secret": False},
-                {"key": "WEBUI_HOST", "value": WEBUI_HOST, "secret": False},
-                {"key": "WEBUI_PORT", "value": str(WEBUI_PORT), "secret": False},
             ],
-            "note": "配置为只读；修改请更新 .env 并重启服务。",
+            "note": "配置为只读；WebUI 无独立密码，直接使用 HA_URL / HA_TOKEN 连接 HA；修改请更新 .env 并重启服务。",
         }
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(_: Any = Depends(require_auth)) -> HTMLResponse:
+    async def index() -> HTMLResponse:
         return HTMLResponse(_render_index(await _status_data(), _config_data()))
 
     @app.get("/api/status")
-    async def api_status(_: Any = Depends(require_auth)) -> JSONResponse:
+    async def api_status() -> JSONResponse:
         return JSONResponse(await _status_data())
 
     @app.get("/api/config")
-    async def api_config(_: Any = Depends(require_auth)) -> JSONResponse:
+    async def api_config() -> JSONResponse:
         return JSONResponse(_config_data())
 
     @app.post("/tool", response_class=HTMLResponse)
-    async def run_tool_form(request: Request, _: Any = Depends(require_auth)) -> HTMLResponse:
+    async def run_tool_form(request: Request) -> HTMLResponse:
         form = await request.form()
         name = str(form.get("name") or "")
         raw_params = str(form.get("params") or "").strip() or "{}"
@@ -210,7 +171,7 @@ def create_app(token: str | None = None) -> FastAPI:
         return HTMLResponse(_render_tool_result(name, raw_params, result, status))
 
     @app.post("/api/tool/{name}")
-    async def api_tool(name: str, request: Request, _: Any = Depends(require_auth)) -> JSONResponse:
+    async def api_tool(name: str, request: Request) -> JSONResponse:
         raw = await request.body()
         try:
             payload = json.loads(raw.decode("utf-8")) if raw and raw.strip() else {}
@@ -345,16 +306,10 @@ def _render_tool_result(name: str, params: str, result: Any, status: int) -> str
 
 def main() -> None:
     setup_logging()
-    if not WEBUI_ENABLED:
-        log.info("WEBUI_ENABLED=false，WebUI 不启动（默认关闭）")
-        return
-    if not WEBUI_TOKEN:
-        log.error("WEBUI_ENABLED=true 但未设置 WEBUI_TOKEN，拒绝启动 WebUI")
-        raise SystemExit(2)
     import uvicorn
 
     log.info("startup webui host=%s port=%s version=%s", WEBUI_HOST, WEBUI_PORT, __version__)
-    uvicorn.run(create_app(WEBUI_TOKEN), host=WEBUI_HOST, port=WEBUI_PORT, log_level="warning")
+    uvicorn.run(create_app(), host=WEBUI_HOST, port=WEBUI_PORT, log_level="warning")
 
 
 if __name__ == "__main__":
