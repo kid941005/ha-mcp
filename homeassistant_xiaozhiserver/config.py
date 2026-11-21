@@ -109,3 +109,9 @@ DANGER_CONFIRM_ENABLED = env_bool("DANGER_CONFIRM_ENABLED", True)
 DANGER_CONFIRM_TTL = env_float("DANGER_CONFIRM_TTL", 120.0, 1.0, 86400.0)
 DANGEROUS_DOMAINS = env_set("DANGEROUS_DOMAINS", "lock,alarm_control_panel")
 DANGEROUS_COVER_CLASSES = env_set("DANGEROUS_COVER_CLASSES", "garage,door,gate,window")
+
+# 可选 WebUI（默认关闭；通过 docker compose profile 单独启动，不影响 MCP 桥接）
+WEBUI_ENABLED = env_bool("WEBUI_ENABLED", False)
+WEBUI_HOST = env_str("WEBUI_HOST", "0.0.0.0")
+WEBUI_PORT = env_int("WEBUI_PORT", 8099, 1, 65535)
+WEBUI_TOKEN = env_str("WEBUI_TOKEN", "")

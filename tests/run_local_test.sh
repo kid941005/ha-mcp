@@ -46,3 +46,6 @@ fi
 
 echo "===== e2e (stdio) ====="
 "$PY" tests/e2e_mcp_client.py
+
+echo "===== webui smoke ====="
+WEBUI_TOKEN=local-webui-token "$PY" tests/webui_smoke.py

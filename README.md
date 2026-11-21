@@ -3,7 +3,7 @@
 > 把 **Home Assistant** 的智能家居设备封装成标准 **MCP（Model Context Protocol）** 工具，
 > 供**小智（xiaozhi-server）**通过 **MCP 接入点**用自然语言查询与控制，支持 Docker 一键部署。
 
-当前版本：**v1.11.1** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
+当前版本：**v1.12.0** · Python 3.12 · 传输：**stdio**（由 `mcp_pipe.py` 桥接小智 MCP 接入点 WebSocket）
 
 ---
 
@@ -42,6 +42,7 @@
 | 健壮错误处理 | 所有工具返回结构化 JSON；失败给 `code` / `message` / `hint`，不抛异常堆栈、不使服务崩溃 |
 | 配置安全 | `HA_URL` / `HA_TOKEN` / `MCP_ENDPOINT` 只从环境变量读取，不写入镜像或代码 |
 | 离线可测 | 自带 fake HA 模拟器与 stdio 端到端测试，无需真实 Home Assistant 即可验证全部工具 |
+| 可选 WebUI | 状态页 + 工具调试台 + 配置只读，独立进程/容器，默认关闭；`WEBUI_TOKEN` 鉴权，敏感值仅掩码展示 |
 
 ---
 
@@ -87,17 +88,19 @@ homeassistant-xiaozhiserver/
 │   ├── service.py                   # 动作映射、状态/属性预期、回读校验
 │   ├── danger.py                    # 危险设备判定、一次性确认令牌
 │   ├── views.py                     # 实体摘要、可控标记、按设备聚合
-│   └── server.py                    # 六个 MCP 工具、stdio 进程入口
+│   ├── server.py                    # 六个 MCP 工具、stdio 进程入口
+│   └── webui.py                     # 可选 WebUI：状态页/工具调试台/配置只读
 ├── server.py                        # 兼容入口（等价于 python -m homeassistant_xiaozhiserver）
 ├── mcp_pipe.py                      # 小智 MCP 接入点桥接（WebSocket ↔ stdio）
 ├── requirements.txt
-├── Dockerfile                       # bridge 镜像（stdio MCP server + mcp_pipe）
+├── Dockerfile                       # bridge/WebUI 共用镜像（stdio MCP server + mcp_pipe）
 ├── docker-compose.yml               # 独立运行（默认 GHCR 镜像，无端口）
 ├── .env.example
 ├── tests/
 │   ├── fake_ha.py                   # 离线 HA 模拟器
 │   ├── e2e_mcp_client.py            # stdio 端到端 MCP 客户端断言测试
-│   └── run_local_test.sh
+│   ├── run_local_test.sh
+│   └── webui_smoke.py               # WebUI 鉴权与接口冒烟测试
 └── README.md
 ```
 
@@ -113,6 +116,7 @@ homeassistant-xiaozhiserver/
 | `views.py` | 实体视图、关键属性裁剪、可控性/危险标记、按物理设备聚合 |
 | `server.py` | 六个 MCP 工具；固定 `stdio` 传输；进程入口 |
 | `mcp_pipe.py` | 连接小智 MCP 接入点，启动 stdio MCP server，双向搬运 JSON-RPC，断线自动重连 |
+| `webui.py` | 可选 WebUI（FastAPI）：状态查看、工具调试、配置只读；默认关闭，独立进程运行 |
 
 ---
 
@@ -141,6 +145,10 @@ homeassistant-xiaozhiserver/
 | `DANGER_CONFIRM_TTL` | | `120` | 危险操作确认令牌有效期（秒），一次性使用 |
 | `DANGEROUS_DOMAINS` | | `lock,alarm_control_panel` | 视为危险设备的 domain（逗号分隔） |
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
+| `WEBUI_ENABLED` | | `false` | 是否启动可选 WebUI；默认关闭，不影响 MCP 桥接 |
+| `WEBUI_TOKEN` | WebUI 启用时必填 | — | WebUI 鉴权口令（HTTP Basic 密码或 Bearer Token）；未设置则 WebUI 拒绝启动 |
+| `WEBUI_HOST` | | `0.0.0.0` | WebUI 监听地址（容器内保持 0.0.0.0，宿主机映射建议限定 127.0.0.1） |
+| `WEBUI_PORT` | | `8099` | WebUI 监听端口 |
 
 > 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
 > 安全：`HA_TOKEN` / `MCP_ENDPOINT` 只通过环境变量注入，不写入镜像、代码或 Git。
@@ -162,9 +170,9 @@ cp .env.example .env
 
 ### 5.2 Docker Compose（推荐）
 
-`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.1`，无需本地构建：
+`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.12.0`，无需本地构建：
 
-> 同一版本也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:1.11.1`（及 `:latest`），网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
+> 同一版本也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:1.12.0`（及 `:latest`），网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
 
 ```bash
 docker compose pull
@@ -181,7 +189,7 @@ MCP_PIPE - MCP接入点连接成功
 MCP_PIPE - 已启动 MCP server：...
 ```
 
-> 本服务**不监听任何端口**，compose 中没有 `ports` / `expose` / `healthcheck`。判断存活看容器状态与日志，不要访问 8090。
+> **bridge 服务不监听任何端口**，其 compose 定义中没有 `ports` / `expose` / `healthcheck`；判断存活看容器状态与日志，不要访问 8090。可选的 WebUI 服务另有一条仅绑定 `127.0.0.1` 的端口映射（见 5.5），与 bridge 无关。
 
 ### 5.3 本地开发（无 Docker）
 
@@ -212,7 +220,7 @@ python -m homeassistant_xiaozhiserver
     build:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.11.1
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.12.0
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:
@@ -231,6 +239,42 @@ docker compose logs -f homeassistant-xiaozhiserver-bridge
 ```
 
 > bridge 主动连出到 `MCP_ENDPOINT`，与 `xiaozhi-server` 不需要同网络，也不需要为它做端口映射。
+
+### 5.5 可选 WebUI（默认关闭）
+
+WebUI 是**独立进程/独立容器**，用于查看运行状态、调试六个工具、只读查看配置；它不在 MCP 桥接链路里，关闭时对桥接零影响。
+
+1. 在 `.env` 中启用并设置强口令（务必使用足够长的随机串）：
+
+   ```bash
+   WEBUI_ENABLED=true
+   WEBUI_TOKEN=请替换为足够长的随机字符串
+   WEBUI_PORT=8099
+   ```
+
+2. 用 compose profile 启动（默认 `docker compose up -d` 不会启动它）：
+
+   ```bash
+   docker compose --profile webui up -d homeassistant-xiaozhiserver-webui
+   docker compose logs -f homeassistant-xiaozhiserver-webui
+   ```
+
+3. 浏览器访问 `http://127.0.0.1:8099/`，用户名任意、密码填 `WEBUI_TOKEN`（也支持 `Authorization: Bearer <WEBUI_TOKEN>`）。
+
+本机直接运行（不使用 Docker）：
+
+```bash
+export WEBUI_ENABLED=true
+export WEBUI_TOKEN="你的强随机口令"
+python -m homeassistant_xiaozhiserver.webui
+```
+
+安全说明：
+
+- compose 的端口映射固定为 `127.0.0.1:8099:8099`，默认只允许本机访问；远程访问请用 SSH 隧道或带鉴权的反向代理。
+- 页面与 `/api/status`、`/api/config` 只展示掩码后的 `HA_TOKEN` / `MCP_ENDPOINT` 令牌，不会回传明文。
+- 工具调试台只允许调用六个白名单工具，参数必须是 JSON 对象。
+- 未设置 `WEBUI_TOKEN` 时 WebUI 拒绝启动（退出码 2），避免无鉴权暴露。
 
 ---
 
@@ -594,7 +638,7 @@ export TEST_TOKEN=任意本地测试口令
 bash tests/run_local_test.sh
 ```
 
-脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。整个测试不需要 `/ready` 或 8090 端口。
+脚本会启动 fake HA（HTTP 8123 + WebSocket 8124），等待 8123 可连接后运行端到端断言；e2e 客户端会以 `stdio` 子进程方式启动 `server.py`，结束后自动清理。随后运行 `tests/webui_smoke.py`，校验 WebUI 的鉴权、状态、配置掩码与工具白名单。整个测试不需要 `/ready` 或 8090 端口。
 
 也可分两个终端手动运行：
 
@@ -632,6 +676,7 @@ python tests/e2e_mcp_client.py
 - 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，并仅授予必要的设备控制权限。
 - 若 `mcp-endpoint-server` 在公网，使用 `wss://` 并确保 token 不泄露；`mcp_pipe.py` 日志已对 query 脱敏。
+- 可选 WebUI 默认关闭；启用时必须设置强随机 `WEBUI_TOKEN`，并且只把端口映射到 `127.0.0.1`，不要直接暴露公网；页面和 API 只展示掩码后的敏感值。
 
 ---
 
@@ -640,6 +685,7 @@ python tests/e2e_mcp_client.py
 
 | 版本 | 主要变化 |
 |---|---|
+| v1.12.0 | 新增可选 WebUI（默认关闭）：状态页、六工具调试台、配置只读；FastAPI + 服务端渲染，无前端构建；`WEBUI_TOKEN` 必填、Basic/Bearer 鉴权，敏感值掩码；独立 compose profile，不改变 bridge 出站拓扑；新增 `tests/webui_smoke.py` |
 | v1.11.1 | 修复 `list_devices` 无过滤时忽略 `DEFAULT_LIST_LIMIT`、固定按 20 条分页的问题（现按配置通常 50 条）；默认提示动态显示条数，`has_more=true` 时提示用 `keyword`/`area` 精确过滤；回归测试增加 `applied_limit_gt: 20` 断言，防止再次退化 |
 | v1.11.0 | `list_devices` 易用性与防误用：支持 `query`/`q`/`search`/`name` 关键字别名；未知参数返回 `invalid_argument` 并列出可用参数（不再静默忽略）；无过滤条件时默认 `controllable_only=true` 且每页 20 条；工具描述内置「点名设备直接 control_device」硬约束 |
 | v1.10.1 | 全项目冗余审计与清理：补齐 README 第 9 章标题、清理 xiaozhi-server 旧「方式 B」MCP 配置（`deploy/data/.mcp_server_settings.json` 置空）、更新 `deploy/.env` 服务名并补充 `MCP_ENDPOINT` 说明；代码层确认已无 HTTP/SSE/uvicorn/端口残留 |
