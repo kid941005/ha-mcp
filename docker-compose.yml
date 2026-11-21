@@ -31,5 +31,5 @@ services:
       WEBUI_ENABLED: "true"
       WEBUI_PORT: "8099"
     ports:
-      # 仅绑定本机回环，避免把管理界面暴露到公网；需要远程访问请走 SSH 隧道或反向代理
-      - "127.0.0.1:${WEBUI_PORT:-8099}:8099"
+      # WEBUI_BIND 默认为 127.0.0.1（仅本机）；局域网访问时在 .env 中设为宿主机局域网 IP
+      - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-8099}:8099"

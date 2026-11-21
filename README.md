@@ -147,7 +147,8 @@ homeassistant-xiaozhiserver/
 | `DANGEROUS_COVER_CLASSES` | | `garage,door,gate,window` | 视为危险 cover 的 device_class（逗号分隔） |
 | `WEBUI_ENABLED` | | `false` | 是否启动可选 WebUI；默认关闭，不影响 MCP 桥接 |
 | `WEBUI_TOKEN` | WebUI 启用时必填 | — | WebUI 鉴权口令（HTTP Basic 密码或 Bearer Token）；未设置则 WebUI 拒绝启动 |
-| `WEBUI_HOST` | | `0.0.0.0` | WebUI 监听地址（容器内保持 0.0.0.0，宿主机映射建议限定 127.0.0.1） |
+| `WEBUI_HOST` | | `0.0.0.0` | WebUI 容器内监听地址 |
+| `WEBUI_BIND` | | `127.0.0.1` | 宿主机端口绑定地址；局域网访问填宿主机局域网 IP |
 | `WEBUI_PORT` | | `8099` | WebUI 监听端口 |
 
 > 数值类环境变量写错不会导致启动崩溃：`config.py` 会记录 warning 并回退默认值或边界值。
@@ -189,7 +190,7 @@ MCP_PIPE - MCP接入点连接成功
 MCP_PIPE - 已启动 MCP server：...
 ```
 
-> **bridge 服务不监听任何端口**，其 compose 定义中没有 `ports` / `expose` / `healthcheck`；判断存活看容器状态与日志，不要访问 8090。可选的 WebUI 服务另有一条仅绑定 `127.0.0.1` 的端口映射（见 5.5），与 bridge 无关。
+> **bridge 服务不监听任何端口**，其 compose 定义中没有 `ports` / `expose` / `healthcheck`；判断存活看容器状态与日志，不要访问 8090。可选的 WebUI 服务另有一条端口映射，宿主机绑定地址由 `WEBUI_BIND` 控制（默认 `127.0.0.1`，见 5.5），与 bridge 无关。
 
 ### 5.3 本地开发（无 Docker）
 
@@ -250,6 +251,8 @@ WebUI 是**独立进程/独立容器**，用于查看运行状态、调试六个
    WEBUI_ENABLED=true
    WEBUI_TOKEN=请替换为足够长的随机字符串
    WEBUI_PORT=8099
+   # 局域网访问时设为宿主机局域网 IP；仅本机访问保持 127.0.0.1
+   WEBUI_BIND=192.168.50.100
    ```
 
 2. 用 compose profile 启动（默认 `docker compose up -d` 不会启动它）：
@@ -259,7 +262,7 @@ WebUI 是**独立进程/独立容器**，用于查看运行状态、调试六个
    docker compose logs -f homeassistant-xiaozhiserver-webui
    ```
 
-3. 浏览器访问 `http://127.0.0.1:8099/`，用户名任意、密码填 `WEBUI_TOKEN`（也支持 `Authorization: Bearer <WEBUI_TOKEN>`）。
+3. 浏览器访问 `http://<宿主机IP>:8099/`（例如 `http://192.168.50.100:8099/`），用户名任意、密码填 `WEBUI_TOKEN`（也支持 `Authorization: Bearer <WEBUI_TOKEN>`）。
 
 本机直接运行（不使用 Docker）：
 
@@ -271,7 +274,7 @@ python -m homeassistant_xiaozhiserver.webui
 
 安全说明：
 
-- compose 的端口映射固定为 `127.0.0.1:8099:8099`，默认只允许本机访问；远程访问请用 SSH 隧道或带鉴权的反向代理。
+- compose 的宿主机绑定地址由 `WEBUI_BIND` 控制：默认 `127.0.0.1` 仅本机；局域网访问时设为本机局域网 IP（如 `192.168.50.100`）。不要直接映射到公网，远程访问优先走 SSH 隧道或带鉴权的反向代理。
 - 页面与 `/api/status`、`/api/config` 只展示掩码后的 `HA_TOKEN` / `MCP_ENDPOINT` 令牌，不会回传明文。
 - 工具调试台只允许调用六个白名单工具，参数必须是 JSON 对象。
 - 未设置 `WEBUI_TOKEN` 时 WebUI 拒绝启动（退出码 2），避免无鉴权暴露。
@@ -676,7 +679,7 @@ python tests/e2e_mcp_client.py
 - 危险设备二次确认 token 只用于**防误操作**，不是权限控制；真正的访问权限仍由 HA 长期令牌决定。
 - 建议为 HA 使用专用长期令牌，并仅授予必要的设备控制权限。
 - 若 `mcp-endpoint-server` 在公网，使用 `wss://` 并确保 token 不泄露；`mcp_pipe.py` 日志已对 query 脱敏。
-- 可选 WebUI 默认关闭；启用时必须设置强随机 `WEBUI_TOKEN`，并且只把端口映射到 `127.0.0.1`，不要直接暴露公网；页面和 API 只展示掩码后的敏感值。
+- 可选 WebUI 默认关闭；启用时必须设置强随机 `WEBUI_TOKEN`，并通过 `WEBUI_BIND` 限制为可信内网地址，不要直接暴露公网；页面和 API 只展示掩码后的敏感值。
 
 ---
 
