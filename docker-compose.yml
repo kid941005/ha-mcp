@@ -5,7 +5,7 @@
 services:
   homeassistant-xiaozhiserver-bridge:
     # 使用 GHCR 已发布镜像；如需本地构建，注释掉 image 并启用下面两行 build。
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.12.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
     # build:
     #   context: .
     #   dockerfile: Dockerfile
@@ -19,7 +19,7 @@ services:
   # 可选 WebUI：默认不启动。需要时：
   #   docker compose --profile webui up -d homeassistant-xiaozhiserver-webui
   homeassistant-xiaozhiserver-webui:
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.12.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
     container_name: homeassistant-xiaozhiserver-webui
     restart: unless-stopped
     profiles: ["webui"]

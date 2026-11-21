@@ -170,9 +170,9 @@ cp .env.example .env
 
 ### 5.2 Docker Compose（推荐）
 
-`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:1.12.0`，无需本地构建：
+`docker-compose.yml` 默认拉取已发布的 GHCR 镜像 `ghcr.io/kid941005/homeassistant-xiaozhiserver:latest`，无需本地构建：
 
-> 同一版本也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:1.12.0`（及 `:latest`），网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
+> 同一镜像也会同步推送到 Docker Hub：`kid941005/homeassistant-xiaozhiserver:latest`，网络访问 Docker Hub 更快时可把 `image:` 换成该地址。
 
 ```bash
 docker compose pull
@@ -220,7 +220,7 @@ python -m homeassistant_xiaozhiserver
     build:
       context: ../homeassistant-xiaozhiserver
       dockerfile: Dockerfile
-    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:1.12.0
+    image: ghcr.io/kid941005/homeassistant-xiaozhiserver:latest
     container_name: homeassistant-xiaozhiserver-bridge
     restart: unless-stopped
     env_file:
